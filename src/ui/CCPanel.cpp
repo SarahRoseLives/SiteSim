@@ -5,16 +5,8 @@
 
 CCPanel::CCPanel(ControlChannel& cc, SoapyTx& tx) : m_cc(cc), m_tx(tx) {}
 
-void CCPanel::render() {
+void CCPanel::render(const SiteConfig& cfg) {
     ImGui::Begin("Control Channel");
-
-    const auto& cfg = [this]() -> const SiteConfig& {
-        // We need to access config — stored in ControlChannel
-        // We'll just read what we know from the tx side
-        static SiteConfig dummy;
-        return dummy;
-    };
-    (void)cfg;
 
     ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "System Status");
     ImGui::Separator();
@@ -30,8 +22,15 @@ void CCPanel::render() {
 
     ImGui::Spacing();
 
+    // TX / Site-input frequencies
+    ImGui::Text("TX (HackRF):  %.6f MHz", cfg.ccFreqHz / 1e6);
+    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.55f, 1.0f),
+                       "RX (RTL-SDR): %.6f MHz", cfg.rxFreqHz() / 1e6);
+
+    ImGui::Spacing();
+
     // Frames sent
-    ImGui::Text("Frames sent: %llu", (unsigned long long)m_cc.frameCount());
+    ImGui::Text("Frames TX: %llu", (unsigned long long)m_cc.frameCount());
 
     ImGui::Spacing();
     ImGui::Separator();

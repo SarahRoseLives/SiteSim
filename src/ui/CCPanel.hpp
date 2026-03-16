@@ -5,7 +5,7 @@
 class CCPanel {
 public:
     CCPanel(ControlChannel& cc, SoapyTx& tx);
-    void render();
+    void render(const SiteConfig& cfg);  // cfg for TX/RX freq display
 
 private:
     ControlChannel& m_cc;

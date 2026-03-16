@@ -121,7 +121,7 @@ void App::run() {
         renderStatusBar();
 
         sitePanel.render();
-        ccPanel.render();
+        ccPanel.render(sitePanel.config());
         logPanel.render();
 
         ImGui::Render();
