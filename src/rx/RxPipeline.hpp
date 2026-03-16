@@ -5,6 +5,7 @@
 #include <functional>
 #include <string>
 #include <thread>
+#include <array>
 
 // Forward-declare dsd-neo C types to avoid pulling all headers into App.hpp
 struct dsd_opts;
@@ -58,5 +59,14 @@ private:
     dsd_state* m_state = nullptr;
 
     std::thread       m_thread;
+    std::thread       m_stderrThread;
     std::atomic<bool> m_running{false};
+
+    int m_stderrSavedFd = -1;  // original stderr fd saved across redirect
+    int m_pipeRead      = -1;
+    int m_pipeWrite     = -1;
+
+    void startStderrCapture();
+    void stopStderrCapture();
+    static void stderrReaderThread(RxPipeline* self);
 };

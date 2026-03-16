@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <unistd.h>
+#include <fcntl.h>
 
 // Global pointer for C-style hook callbacks — RxPipeline is a singleton in practice.
 static RxPipeline* g_rx_pipeline = nullptr;
@@ -47,15 +49,29 @@ bool RxPipeline::start()
 
     // ── RTL-SDR input ──────────────────────────────────────────────────────
     m_opts->audio_in_type       = AUDIO_IN_RTL;
+    snprintf(m_opts->audio_in_dev, sizeof(m_opts->audio_in_dev), "rtl");
     m_opts->rtlsdr_center_freq  = static_cast<uint32_t>(m_cfg.rxFreqHz());
     m_opts->rtl_gain_value      = 300;   // 30.0 dB (tenths of dB)
     m_opts->rtl_dsp_bw_khz      = 12;
     m_opts->rtl_dev_index       = 0;
 
-    // ── P25 Phase 1 mode ──────────────────────────────────────────────────
+    // ── P25 Phase 1 only — disable all other protocols to prevent crashes ──
+    // (other decoders call private vocoder stubs that can't safely execute)
     m_opts->frame_p25p1         = 1;
+    m_opts->frame_p25p2         = 0;
+    m_opts->frame_dstar         = 0;
+    m_opts->frame_x2tdma        = 0;
+    m_opts->frame_nxdn48        = 0;
+    m_opts->frame_nxdn96        = 0;
+    m_opts->frame_dmr           = 0;
+    m_opts->frame_provoice      = 0;
+    m_opts->frame_dpmr          = 0;
+    m_opts->frame_ysf           = 0;
+    m_opts->frame_m17           = 0;
     m_opts->p25_trunk           = 0;     // site input: no trunking follow
     m_opts->p25_isp_mode        = 1;     // interpret TSBKs as ISP (mobile→site)
+    m_opts->errorbars           = 1;     // enable Sync:/NAC: status lines
+    m_opts->verbose             = 2;     // show SPS and sync detail in log
 
     // ── Install ISP TSBK hook ─────────────────────────────────────────────
     dsd_p25_isp_hooks isp_hooks{};
@@ -70,6 +86,13 @@ bool RxPipeline::start()
 
     m_running.store(true);
     exitflag = 0;
+    startStderrCapture();
+
+    char startMsg[128];
+    snprintf(startMsg, sizeof(startMsg), "RX started — RTL-SDR @ %.4f MHz (P25P1 ISP mode)",
+             m_cfg.rxFreqHz() / 1e6);
+    m_log(startMsg);
+
     m_thread = std::thread(&RxPipeline::engineThread, this);
     return true;
 }
@@ -81,6 +104,8 @@ void RxPipeline::stop()
     exitflag = 1;          // signals dsd_engine_run() to exit its loop
     if (m_thread.joinable())
         m_thread.join();
+
+    stopStderrCapture();
 
     if (m_opts) {
         // Clear hooks before freeing so dangling calls cannot fire.
@@ -205,4 +230,75 @@ void RxPipeline::onWriteEvent(dsd_opts*, dsd_state*, uint8_t, uint8_t swrite,
         msg.pop_back();
     if (!msg.empty())
         g_rx_pipeline->m_log(msg);
+}
+
+// ── stderr capture — routes dsd-neo console output to RX log ─────────────────
+
+void RxPipeline::startStderrCapture()
+{
+    int fds[2];
+    if (pipe(fds) != 0) return;
+
+    m_pipeRead  = fds[0];
+    m_pipeWrite = fds[1];
+
+    // Make pipe read end non-blocking so reader thread can poll for stop
+    int flags = fcntl(m_pipeRead, F_GETFL, 0);
+    fcntl(m_pipeRead, F_SETFL, flags | O_NONBLOCK);
+
+    // Save original stderr and redirect it to the pipe write end
+    m_stderrSavedFd = dup(STDERR_FILENO);
+    dup2(m_pipeWrite, STDERR_FILENO);
+    fflush(stderr);
+
+    m_stderrThread = std::thread(&RxPipeline::stderrReaderThread, this);
+}
+
+void RxPipeline::stopStderrCapture()
+{
+    // Restore stderr before joining so any final output still drains
+    if (m_stderrSavedFd >= 0) {
+        fflush(stderr);
+        dup2(m_stderrSavedFd, STDERR_FILENO);
+        close(m_stderrSavedFd);
+        m_stderrSavedFd = -1;
+    }
+    // Close pipe write end — this makes the read end return EOF
+    if (m_pipeWrite >= 0) { close(m_pipeWrite); m_pipeWrite = -1; }
+    if (m_stderrThread.joinable()) m_stderrThread.join();
+    if (m_pipeRead  >= 0) { close(m_pipeRead);  m_pipeRead  = -1; }
+}
+
+void RxPipeline::stderrReaderThread(RxPipeline* self)
+{
+    char buf[512];
+    std::string line;
+
+    while (true) {
+        ssize_t n = read(self->m_pipeRead, buf, sizeof(buf) - 1);
+        if (n <= 0) {
+            if (n == 0) break;                           // EOF — pipe closed
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (!self->m_running.load()) break;
+                usleep(50'000);                          // 50 ms poll
+                continue;
+            }
+            break;                                       // real error
+        }
+        buf[n] = '\0';
+        for (int i = 0; i < n; ++i) {
+            if (buf[i] == '\n') {
+                // Strip trailing \r
+                while (!line.empty() && line.back() == '\r') line.pop_back();
+                if (!line.empty() && self->m_log)
+                    self->m_log(line);
+                line.clear();
+            } else {
+                line += buf[i];
+            }
+        }
+    }
+    // Flush any partial line
+    if (!line.empty() && self->m_log)
+        self->m_log(line);
 }
