@@ -72,21 +72,6 @@ void SitePanel::render() {
     ImGui::Checkbox("RF Amplifier", &m_cfg.ampEnabled);
 
     ImGui::Spacing();
-    ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "Simulation");
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    ImGui::Checkbox("Activity Simulation", &m_cfg.simEnabled);
-
-    ImGui::Text("Voice Channel #");
-    ImGui::SetNextItemWidth(-1);
-    int vchan = m_cfg.vChanNum;
-    if (ImGui::InputInt("##vchan", &vchan)) {
-        if (vchan < 0) vchan = 0;
-        m_cfg.vChanNum = uint16_t(vchan);
-    }
-
-    ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 

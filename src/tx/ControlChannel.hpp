@@ -3,7 +3,6 @@
 #include "p25/C4FM.hpp"
 #include <string>
 #include <vector>
-#include <queue>
 #include <deque>
 #include <atomic>
 #include <thread>
@@ -20,7 +19,6 @@ struct SiteConfig {
     double   ccFreqHz  = 145.050e6;
     double   gainDb    = 20.0;
     bool     ampEnabled = false;
-    bool     simEnabled = true;
     uint16_t vChanNum  = 1;
 };
 
@@ -41,7 +39,6 @@ public:
 
 private:
     void producerThread();
-    void simulationThread();
     void addLog(const std::string& msg);
 
     SoapyTx&    m_tx;
@@ -51,10 +48,6 @@ private:
     std::atomic<bool>   m_running{false};
     std::atomic<uint64_t> m_frameCount{0};
     std::thread         m_producer;
-    std::thread         m_sim;
-
-    std::queue<std::array<uint8_t, 12>> m_activityQueue;
-    mutable std::mutex  m_queueMutex;
 
     mutable std::mutex  m_logMutex;
     std::deque<LogEntry> m_log;
