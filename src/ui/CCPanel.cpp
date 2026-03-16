@@ -23,9 +23,9 @@ void CCPanel::render() {
     // TX status indicator
     bool running = m_cc.isRunning();
     if (running) {
-        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.3f, 1.0f), "\xe2\x97\x8f TX ACTIVE");
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.3f, 1.0f), "[*] TX ACTIVE");
     } else {
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "\xe2\x97\x8b Stopped");
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "[ ] Stopped");
     }
 
     ImGui::Spacing();
@@ -45,7 +45,7 @@ void CCPanel::render() {
             ImVec4(0.55f + 0.25f * pulse, 0.05f, 0.05f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.1f, 0.1f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-        if (ImGui::Button("  \xe2\x96\xa0  STOP TX  ", ImVec2(-1, 48))) {
+        if (ImGui::Button("  [X]  STOP TX  ", ImVec2(-1, 48))) {
             m_cc.stop();
             m_tx.stopTx();
         }
@@ -54,7 +54,7 @@ void CCPanel::render() {
         ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.05f, 0.45f, 0.10f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.10f, 0.60f, 0.15f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-        if (ImGui::Button("  \xe2\x96\xb6  START TX  ", ImVec2(-1, 48))) {
+        if (ImGui::Button("  [>]  START TX  ", ImVec2(-1, 48))) {
             m_tx.startTx();
             m_cc.start();
         }

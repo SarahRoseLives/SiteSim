@@ -58,7 +58,7 @@ void SitePanel::render() {
     ImGui::Separator();
     ImGui::Spacing();
 
-    // CC Freq — band-locked to 2m / 70cm amateur bands only
+    // CC Freq - band-locked to 2m / 70cm amateur bands only
     m_bandSel.render(m_cfg.ccFreqHz);
 
     // Gain

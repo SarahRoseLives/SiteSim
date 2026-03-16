@@ -19,8 +19,8 @@ struct Band {
 };
 
 static constexpr Band kBands[] = {
-    { "2m  — 144–148 MHz",  144.0e6, 148.0e6, "Common: 145.050, 146.520" },
-    { "70cm — 420–450 MHz", 420.0e6, 450.0e6, "Common: 446.000, 446.500" },
+    { "2m  (144-148 MHz)",  144.0e6, 148.0e6, "Common: 145.050, 146.520" },
+    { "70cm (420-450 MHz)", 420.0e6, 450.0e6, "Common: 446.000, 446.500" },
 };
 static constexpr int kNumBands = 2;
 
@@ -74,7 +74,7 @@ public:
 
         // ── Amateur band disclaimer ───────────────────────────────────────
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.75f, 0.2f, 1.0f));
-        ImGui::TextWrapped("AMATEUR RADIO USE ONLY — Transmit only on "
+        ImGui::TextWrapped("AMATEUR RADIO USE ONLY - Transmit only on "
                            "frequencies you are licensed to use.");
         ImGui::PopStyleColor();
         ImGui::Spacing();
@@ -126,11 +126,11 @@ public:
         const auto& b = bands::kBands[m_bandIdx];
         if (m_outOfBand) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.35f, 1.0f));
-            ImGui::TextWrapped("Out of band! Valid range: %.3f – %.3f MHz",
+            ImGui::TextWrapped("Out of band! Valid range: %.3f - %.3f MHz",
                                b.minHz / 1e6, b.maxHz / 1e6);
             ImGui::PopStyleColor();
         } else {
-            ImGui::TextDisabled("Range: %.3f – %.3f MHz",
+            ImGui::TextDisabled("Range: %.3f - %.3f MHz",
                                 b.minHz / 1e6, b.maxHz / 1e6);
         }
         ImGui::TextDisabled("Frequency (MHz)");

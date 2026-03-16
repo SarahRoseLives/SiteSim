@@ -29,7 +29,7 @@ bool App::init() {
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
     m_window = SDL_CreateWindow(
-        "SiteSim — P25 Control Channel",
+        "SiteSim - P25 Control Channel",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         1280, 800,
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
@@ -92,7 +92,7 @@ bool App::init() {
         }
     }
     if (!opened && m_tx.lastError().empty())
-        m_statusMsg = "No SDR device found — simulation mode";
+        m_statusMsg = "No SDR device found - simulation mode";
 
     return true;
 }
@@ -237,13 +237,13 @@ void App::renderStatusBar() {
     else
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "SiteSim v0.1  |  P25 Phase 1 TSCC Emulator");
 
-    // Device indicator dot — right-aligned
+    // Device indicator dot - right-aligned
     ImGui::SameLine();
     bool devOpen = m_tx.isOpen();
     ImVec4 dotCol = devOpen ? ImVec4(0.2f, 1.0f, 0.4f, 1.0f) : ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
-    float dotW = ImGui::CalcTextSize("● HackRF").x + 12.0f;
+    float dotW = ImGui::CalcTextSize("[*] HackRF").x + 12.0f;
     ImGui::SetCursorPosX(ImGui::GetWindowWidth() - dotW);
-    ImGui::TextColored(dotCol, devOpen ? "● HackRF" : "● No Device");
+    ImGui::TextColored(dotCol, devOpen ? "[*] HackRF" : "[ ] No Device");
 
     ImGui::End();
 }
