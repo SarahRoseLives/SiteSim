@@ -3,7 +3,8 @@
 #include <cstdio>
 #include <cmath>
 
-CCPanel::CCPanel(ControlChannel& cc, SoapyTx& tx) : m_cc(cc), m_tx(tx) {}
+CCPanel::CCPanel(ControlChannel& cc, SoapyTx& tx, RxPipeline& rx)
+    : m_cc(cc), m_tx(tx), m_rx(rx) {}
 
 void CCPanel::render(const SiteConfig& cfg) {
     ImGui::Begin("Control Channel");
@@ -46,6 +47,7 @@ void CCPanel::render(const SiteConfig& cfg) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
         if (ImGui::Button("  [X]  STOP TX  ", ImVec2(-1, 48))) {
             m_cc.stop();
+            m_rx.stop();
             m_tx.stopTx();
         }
         ImGui::PopStyleColor(3);
@@ -56,6 +58,8 @@ void CCPanel::render(const SiteConfig& cfg) {
         if (ImGui::Button("  [>]  START TX  ", ImVec2(-1, 48))) {
             m_tx.startTx();
             m_cc.start();
+            m_rx.configure(cfg);
+            m_rx.start();
         }
         ImGui::PopStyleColor(3);
     }

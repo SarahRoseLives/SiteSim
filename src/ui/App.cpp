@@ -12,7 +12,7 @@
 #include <cmath>
 #include <memory>
 
-App::App() : m_cc(m_tx) {}
+App::App() : m_cc(m_tx), m_rx(m_cc, [this](const std::string&) {}) {}
 
 App::~App() { shutdown(); }
 
@@ -100,8 +100,13 @@ bool App::init() {
 void App::run() {
     // Panels live here so they capture references correctly
     SitePanel sitePanel(m_cc, m_tx);
-    CCPanel   ccPanel(m_cc, m_tx);
+    CCPanel   ccPanel(m_cc, m_tx, m_rx);
     LogPanel  logPanel(m_cc);
+
+    // Wire RxPipeline log output to the RX log tab
+    m_rx.setLogCallback([&logPanel](const std::string& msg) {
+        logPanel.addRxEntry(msg);
+    });
 
     while (m_running) {
         SDL_Event event;
@@ -249,6 +254,7 @@ void App::renderStatusBar() {
 }
 
 void App::shutdown() {
+    if (m_rx.isRunning()) m_rx.stop();
     if (m_cc.isRunning()) m_cc.stop();
     m_tx.stopTx();
     m_tx.close();

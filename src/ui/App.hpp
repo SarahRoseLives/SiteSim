@@ -1,6 +1,7 @@
 #pragma once
 #include "tx/SoapyTx.hpp"
 #include "tx/ControlChannel.hpp"
+#include "rx/RxPipeline.hpp"
 
 struct SDL_Window;
 typedef void* SDL_GLContext;
@@ -24,6 +25,7 @@ private:
 
     SoapyTx        m_tx;
     ControlChannel m_cc;
+    RxPipeline     m_rx;
 
     std::vector<std::string> m_deviceList;
     std::string m_statusMsg;

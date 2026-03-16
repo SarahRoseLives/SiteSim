@@ -28,6 +28,7 @@ set(SITESIM_SOURCES
     src/p25/C4FM.cpp
     src/tx/SoapyTx.cpp
     src/tx/ControlChannel.cpp
+    src/rx/RxPipeline.cpp
     src/ui/App.cpp
     src/ui/SitePanel.cpp
     src/ui/CCPanel.cpp
@@ -44,6 +45,7 @@ target_include_directories(sitesim PRIVATE
     ${NLOHMANN_DIR}
     ${SOAPY_INCLUDE_DIRS}
     ${SDL2_INCLUDE_DIRS}
+    /usr/local/include
 )
 
 target_link_libraries(sitesim PRIVATE
@@ -51,6 +53,18 @@ target_link_libraries(sitesim PRIVATE
     ${SDL2_LIBRARIES}
     OpenGL::GL
     dl
+    -L/usr/local/lib
+    -Wl,--allow-shlib-undefined
+    dsd-neo_engine
+    dsd-neo_dispatch
+    dsd-neo_core
+    dsd-neo_runtime
+    dsd-neo_proto_p25
+    dsd-neo_io_radio
+    dsd-neo_io_control
+    dsd-neo_io_audio
+    mbe-neo
+    rtlsdr
 )
 
 target_compile_options(sitesim PRIVATE
