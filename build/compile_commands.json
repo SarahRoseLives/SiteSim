@@ -1,0 +1,98 @@
+[
+{
+  "directory": "/home/rose/Compiled/SiteSim/build",
+  "command": "/usr/bin/c++  -I/home/rose/Compiled/SiteSim/src -I/home/rose/Compiled/SiteSim/third_party/imgui -I/home/rose/Compiled/SiteSim/third_party/imgui/backends -I/home/rose/Compiled/SiteSim/third_party/nlohmann/single_include -I/usr/include/SDL2 -g -std=gnu++20 -D_REENTRANT -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o CMakeFiles/sitesim.dir/src/main.cpp.o -c /home/rose/Compiled/SiteSim/src/main.cpp",
+  "file": "/home/rose/Compiled/SiteSim/src/main.cpp",
+  "output": "CMakeFiles/sitesim.dir/src/main.cpp.o"
+},
+{
+  "directory": "/home/rose/Compiled/SiteSim/build",
+  "command": "/usr/bin/c++  -I/home/rose/Compiled/SiteSim/src -I/home/rose/Compiled/SiteSim/third_party/imgui -I/home/rose/Compiled/SiteSim/third_party/imgui/backends -I/home/rose/Compiled/SiteSim/third_party/nlohmann/single_include -I/usr/include/SDL2 -g -std=gnu++20 -D_REENTRANT -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o CMakeFiles/sitesim.dir/src/p25/TSBK.cpp.o -c /home/rose/Compiled/SiteSim/src/p25/TSBK.cpp",
+  "file": "/home/rose/Compiled/SiteSim/src/p25/TSBK.cpp",
+  "output": "CMakeFiles/sitesim.dir/src/p25/TSBK.cpp.o"
+},
+{
+  "directory": "/home/rose/Compiled/SiteSim/build",
+  "command": "/usr/bin/c++  -I/home/rose/Compiled/SiteSim/src -I/home/rose/Compiled/SiteSim/third_party/imgui -I/home/rose/Compiled/SiteSim/third_party/imgui/backends -I/home/rose/Compiled/SiteSim/third_party/nlohmann/single_include -I/usr/include/SDL2 -g -std=gnu++20 -D_REENTRANT -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o CMakeFiles/sitesim.dir/src/p25/Frame.cpp.o -c /home/rose/Compiled/SiteSim/src/p25/Frame.cpp",
+  "file": "/home/rose/Compiled/SiteSim/src/p25/Frame.cpp",
+  "output": "CMakeFiles/sitesim.dir/src/p25/Frame.cpp.o"
+},
+{
+  "directory": "/home/rose/Compiled/SiteSim/build",
+  "command": "/usr/bin/c++  -I/home/rose/Compiled/SiteSim/src -I/home/rose/Compiled/SiteSim/third_party/imgui -I/home/rose/Compiled/SiteSim/third_party/imgui/backends -I/home/rose/Compiled/SiteSim/third_party/nlohmann/single_include -I/usr/include/SDL2 -g -std=gnu++20 -D_REENTRANT -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o CMakeFiles/sitesim.dir/src/p25/C4FM.cpp.o -c /home/rose/Compiled/SiteSim/src/p25/C4FM.cpp",
+  "file": "/home/rose/Compiled/SiteSim/src/p25/C4FM.cpp",
+  "output": "CMakeFiles/sitesim.dir/src/p25/C4FM.cpp.o"
+},
+{
+  "directory": "/home/rose/Compiled/SiteSim/build",
+  "command": "/usr/bin/c++  -I/home/rose/Compiled/SiteSim/src -I/home/rose/Compiled/SiteSim/third_party/imgui -I/home/rose/Compiled/SiteSim/third_party/imgui/backends -I/home/rose/Compiled/SiteSim/third_party/nlohmann/single_include -I/usr/include/SDL2 -g -std=gnu++20 -D_REENTRANT -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o CMakeFiles/sitesim.dir/src/tx/SoapyTx.cpp.o -c /home/rose/Compiled/SiteSim/src/tx/SoapyTx.cpp",
+  "file": "/home/rose/Compiled/SiteSim/src/tx/SoapyTx.cpp",
+  "output": "CMakeFiles/sitesim.dir/src/tx/SoapyTx.cpp.o"
+},
+{
+  "directory": "/home/rose/Compiled/SiteSim/build",
+  "command": "/usr/bin/c++  -I/home/rose/Compiled/SiteSim/src -I/home/rose/Compiled/SiteSim/third_party/imgui -I/home/rose/Compiled/SiteSim/third_party/imgui/backends -I/home/rose/Compiled/SiteSim/third_party/nlohmann/single_include -I/usr/include/SDL2 -g -std=gnu++20 -D_REENTRANT -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o CMakeFiles/sitesim.dir/src/tx/ControlChannel.cpp.o -c /home/rose/Compiled/SiteSim/src/tx/ControlChannel.cpp",
+  "file": "/home/rose/Compiled/SiteSim/src/tx/ControlChannel.cpp",
+  "output": "CMakeFiles/sitesim.dir/src/tx/ControlChannel.cpp.o"
+},
+{
+  "directory": "/home/rose/Compiled/SiteSim/build",
+  "command": "/usr/bin/c++  -I/home/rose/Compiled/SiteSim/src -I/home/rose/Compiled/SiteSim/third_party/imgui -I/home/rose/Compiled/SiteSim/third_party/imgui/backends -I/home/rose/Compiled/SiteSim/third_party/nlohmann/single_include -I/usr/include/SDL2 -g -std=gnu++20 -D_REENTRANT -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o CMakeFiles/sitesim.dir/src/ui/App.cpp.o -c /home/rose/Compiled/SiteSim/src/ui/App.cpp",
+  "file": "/home/rose/Compiled/SiteSim/src/ui/App.cpp",
+  "output": "CMakeFiles/sitesim.dir/src/ui/App.cpp.o"
+},
+{
+  "directory": "/home/rose/Compiled/SiteSim/build",
+  "command": "/usr/bin/c++  -I/home/rose/Compiled/SiteSim/src -I/home/rose/Compiled/SiteSim/third_party/imgui -I/home/rose/Compiled/SiteSim/third_party/imgui/backends -I/home/rose/Compiled/SiteSim/third_party/nlohmann/single_include -I/usr/include/SDL2 -g -std=gnu++20 -D_REENTRANT -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o CMakeFiles/sitesim.dir/src/ui/SitePanel.cpp.o -c /home/rose/Compiled/SiteSim/src/ui/SitePanel.cpp",
+  "file": "/home/rose/Compiled/SiteSim/src/ui/SitePanel.cpp",
+  "output": "CMakeFiles/sitesim.dir/src/ui/SitePanel.cpp.o"
+},
+{
+  "directory": "/home/rose/Compiled/SiteSim/build",
+  "command": "/usr/bin/c++  -I/home/rose/Compiled/SiteSim/src -I/home/rose/Compiled/SiteSim/third_party/imgui -I/home/rose/Compiled/SiteSim/third_party/imgui/backends -I/home/rose/Compiled/SiteSim/third_party/nlohmann/single_include -I/usr/include/SDL2 -g -std=gnu++20 -D_REENTRANT -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o CMakeFiles/sitesim.dir/src/ui/CCPanel.cpp.o -c /home/rose/Compiled/SiteSim/src/ui/CCPanel.cpp",
+  "file": "/home/rose/Compiled/SiteSim/src/ui/CCPanel.cpp",
+  "output": "CMakeFiles/sitesim.dir/src/ui/CCPanel.cpp.o"
+},
+{
+  "directory": "/home/rose/Compiled/SiteSim/build",
+  "command": "/usr/bin/c++  -I/home/rose/Compiled/SiteSim/src -I/home/rose/Compiled/SiteSim/third_party/imgui -I/home/rose/Compiled/SiteSim/third_party/imgui/backends -I/home/rose/Compiled/SiteSim/third_party/nlohmann/single_include -I/usr/include/SDL2 -g -std=gnu++20 -D_REENTRANT -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o CMakeFiles/sitesim.dir/src/ui/LogPanel.cpp.o -c /home/rose/Compiled/SiteSim/src/ui/LogPanel.cpp",
+  "file": "/home/rose/Compiled/SiteSim/src/ui/LogPanel.cpp",
+  "output": "CMakeFiles/sitesim.dir/src/ui/LogPanel.cpp.o"
+},
+{
+  "directory": "/home/rose/Compiled/SiteSim/build",
+  "command": "/usr/bin/c++  -I/home/rose/Compiled/SiteSim/src -I/home/rose/Compiled/SiteSim/third_party/imgui -I/home/rose/Compiled/SiteSim/third_party/imgui/backends -I/home/rose/Compiled/SiteSim/third_party/nlohmann/single_include -I/usr/include/SDL2 -g -std=gnu++20 -D_REENTRANT -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o CMakeFiles/sitesim.dir/third_party/imgui/imgui.cpp.o -c /home/rose/Compiled/SiteSim/third_party/imgui/imgui.cpp",
+  "file": "/home/rose/Compiled/SiteSim/third_party/imgui/imgui.cpp",
+  "output": "CMakeFiles/sitesim.dir/third_party/imgui/imgui.cpp.o"
+},
+{
+  "directory": "/home/rose/Compiled/SiteSim/build",
+  "command": "/usr/bin/c++  -I/home/rose/Compiled/SiteSim/src -I/home/rose/Compiled/SiteSim/third_party/imgui -I/home/rose/Compiled/SiteSim/third_party/imgui/backends -I/home/rose/Compiled/SiteSim/third_party/nlohmann/single_include -I/usr/include/SDL2 -g -std=gnu++20 -D_REENTRANT -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o CMakeFiles/sitesim.dir/third_party/imgui/imgui_draw.cpp.o -c /home/rose/Compiled/SiteSim/third_party/imgui/imgui_draw.cpp",
+  "file": "/home/rose/Compiled/SiteSim/third_party/imgui/imgui_draw.cpp",
+  "output": "CMakeFiles/sitesim.dir/third_party/imgui/imgui_draw.cpp.o"
+},
+{
+  "directory": "/home/rose/Compiled/SiteSim/build",
+  "command": "/usr/bin/c++  -I/home/rose/Compiled/SiteSim/src -I/home/rose/Compiled/SiteSim/third_party/imgui -I/home/rose/Compiled/SiteSim/third_party/imgui/backends -I/home/rose/Compiled/SiteSim/third_party/nlohmann/single_include -I/usr/include/SDL2 -g -std=gnu++20 -D_REENTRANT -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o CMakeFiles/sitesim.dir/third_party/imgui/imgui_tables.cpp.o -c /home/rose/Compiled/SiteSim/third_party/imgui/imgui_tables.cpp",
+  "file": "/home/rose/Compiled/SiteSim/third_party/imgui/imgui_tables.cpp",
+  "output": "CMakeFiles/sitesim.dir/third_party/imgui/imgui_tables.cpp.o"
+},
+{
+  "directory": "/home/rose/Compiled/SiteSim/build",
+  "command": "/usr/bin/c++  -I/home/rose/Compiled/SiteSim/src -I/home/rose/Compiled/SiteSim/third_party/imgui -I/home/rose/Compiled/SiteSim/third_party/imgui/backends -I/home/rose/Compiled/SiteSim/third_party/nlohmann/single_include -I/usr/include/SDL2 -g -std=gnu++20 -D_REENTRANT -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o CMakeFiles/sitesim.dir/third_party/imgui/imgui_widgets.cpp.o -c /home/rose/Compiled/SiteSim/third_party/imgui/imgui_widgets.cpp",
+  "file": "/home/rose/Compiled/SiteSim/third_party/imgui/imgui_widgets.cpp",
+  "output": "CMakeFiles/sitesim.dir/third_party/imgui/imgui_widgets.cpp.o"
+},
+{
+  "directory": "/home/rose/Compiled/SiteSim/build",
+  "command": "/usr/bin/c++  -I/home/rose/Compiled/SiteSim/src -I/home/rose/Compiled/SiteSim/third_party/imgui -I/home/rose/Compiled/SiteSim/third_party/imgui/backends -I/home/rose/Compiled/SiteSim/third_party/nlohmann/single_include -I/usr/include/SDL2 -g -std=gnu++20 -D_REENTRANT -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o CMakeFiles/sitesim.dir/third_party/imgui/backends/imgui_impl_sdl2.cpp.o -c /home/rose/Compiled/SiteSim/third_party/imgui/backends/imgui_impl_sdl2.cpp",
+  "file": "/home/rose/Compiled/SiteSim/third_party/imgui/backends/imgui_impl_sdl2.cpp",
+  "output": "CMakeFiles/sitesim.dir/third_party/imgui/backends/imgui_impl_sdl2.cpp.o"
+},
+{
+  "directory": "/home/rose/Compiled/SiteSim/build",
+  "command": "/usr/bin/c++  -I/home/rose/Compiled/SiteSim/src -I/home/rose/Compiled/SiteSim/third_party/imgui -I/home/rose/Compiled/SiteSim/third_party/imgui/backends -I/home/rose/Compiled/SiteSim/third_party/nlohmann/single_include -I/usr/include/SDL2 -g -std=gnu++20 -D_REENTRANT -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o CMakeFiles/sitesim.dir/third_party/imgui/backends/imgui_impl_opengl3.cpp.o -c /home/rose/Compiled/SiteSim/third_party/imgui/backends/imgui_impl_opengl3.cpp",
+  "file": "/home/rose/Compiled/SiteSim/third_party/imgui/backends/imgui_impl_opengl3.cpp",
+  "output": "CMakeFiles/sitesim.dir/third_party/imgui/backends/imgui_impl_opengl3.cpp.o"
+}
+]
