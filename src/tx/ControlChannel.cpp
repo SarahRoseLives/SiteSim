@@ -66,6 +66,9 @@ void ControlChannel::producerThread() {
     // Build system TSBKs from current config.
     // IDEN_UP uses the channel plan from SiteConfig so radios can resolve
     // voice channel numbers to actual frequencies.
+    constexpr int kStaticSysCount = 4;
+    constexpr int kBurstLen = 5; // 4 static system messages + 1 live sync broadcast
+
     auto idenUp  = p25::BuildIDENUp(
         m_cfg.chanId,
         m_cfg.bwUnits,
@@ -79,8 +82,8 @@ void ControlChannel::producerThread() {
     auto adjSts  = p25::BuildAdjStsBcast(m_cfg.sysid, m_cfg.rfssid,
                                           uint8_t(m_cfg.siteid + 1), 0, 0, 0x00);
 
-    std::array<std::array<uint8_t, 12>, 4> sysTSBKs = { idenUp, netSts, rfssSts, adjSts };
-    static const char* kSysNames[] = { "IDEN_UP", "NET_STS", "RFSS_STS", "ADJ_STS" };
+    std::array<std::array<uint8_t, 12>, kStaticSysCount> sysTSBKs = { idenUp, netSts, rfssSts, adjSts };
+    static const char* kSysNames[] = { "IDEN_UP", "NET_STS", "RFSS_STS", "ADJ_STS", "SYNC" };
 
     // Pre-build TDU dibit stream (reused every cycle)
     auto tduDibits = p25::BuildTDUFrame(m_cfg.nac);
@@ -95,15 +98,15 @@ void ControlChannel::producerThread() {
             if (!m_running.load()) return;
         }
 
-        // Every 4th frame slot: priority system broadcast (IDEN/NET/RFSS/ADJ)
+        // Every burst includes the static CC messages plus a live sync broadcast.
         // Other slots: drain queued TSBKs, else fill with next sys broadcast
         std::array<uint8_t, 12> tsbk;
         std::string logMsg;
 
-        if (frameN % 4 == 0) {
+        if (frameN % kBurstLen == 0) {
             // Mandatory sys-info slot
-            int idx = sysIdx % 4;
-            tsbk    = sysTSBKs[idx];
+            int idx = sysIdx % kBurstLen;
+            tsbk    = (idx < kStaticSysCount) ? sysTSBKs[idx] : p25::BuildSyncBcast();
             logMsg  = std::string("SYS ") + kSysNames[idx];
             sysIdx++;
         } else {
@@ -114,8 +117,8 @@ void ControlChannel::producerThread() {
                 m_tsbkQueue.pop();
                 logMsg = "ACT TSBK";
             } else {
-                int idx = sysIdx % 4;
-                tsbk    = sysTSBKs[idx];
+                int idx = sysIdx % kBurstLen;
+                tsbk    = (idx < kStaticSysCount) ? sysTSBKs[idx] : p25::BuildSyncBcast();
                 logMsg  = std::string("SYS ") + kSysNames[idx];
                 sysIdx++;
             }
@@ -126,13 +129,12 @@ void ControlChannel::producerThread() {
         addLog(logMsg);
         frameN++;
 
-        // After each full rotation of 4 frames, transmit a TDU to signal
+        // After each full system burst, transmit a TDU to signal
         // end of the TSBK burst. Real P25 CCs do this between bursts.
-        if (frameN % 4 == 0) {
+        if (frameN % kBurstLen == 0) {
             sendFrame(m_tx, m_c4fm, tduDibits);
             // TDU is not a "frame" in the TSBK sense — don't increment frameCount
         }
     }
 }
-
 

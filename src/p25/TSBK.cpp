@@ -1,6 +1,7 @@
 #include "TSBK.hpp"
 #include <cstdint>
 #include <array>
+#include <ctime>
 
 namespace p25 {
 
@@ -172,6 +173,57 @@ std::array<uint8_t, 12> BuildAdjStsBcast(uint16_t adjSysID, uint8_t rfssID, uint
                     (ch << 8) |
                     uint64_t(ssc);
     return buildTSBK(true, TSBK_ADJ_STS_BCAST, 0x00, args);
+}
+
+std::array<uint8_t, 12> BuildSyncBcast() {
+    const std::time_t now = std::time(nullptr);
+
+    std::tm utcTm{};
+    std::tm localTm{};
+    gmtime_r(&now, &utcTm);
+    localtime_r(&now, &localTm);
+
+    int offsetHalfHours = 0;
+#ifdef __USE_MISC
+    offsetHalfHours = static_cast<int>(localTm.tm_gmtoff / 1800);
+#endif
+    if (offsetHalfHours > 31) offsetHalfHours = 31;
+    if (offsetHalfHours < -31) offsetHalfHours = -31;
+
+    const uint8_t us = 0;
+    const uint8_t ist = 1;
+    const uint8_t mm = 0;
+    const uint8_t mc = 0;
+    const uint8_t vl = 1;
+
+    uint8_t ltoff = 0;
+    if (offsetHalfHours < 0)
+        ltoff = static_cast<uint8_t>(0x20 | (-offsetHalfHours & 0x1F));
+    else
+        ltoff = static_cast<uint8_t>(offsetHalfHours & 0x1F);
+
+    const uint8_t year  = static_cast<uint8_t>((utcTm.tm_year + 1900) % 100);
+    const uint8_t month = static_cast<uint8_t>(utcTm.tm_mon + 1);
+    const uint8_t day   = static_cast<uint8_t>(utcTm.tm_mday);
+    const uint8_t hour  = static_cast<uint8_t>(utcTm.tm_hour);
+    const uint8_t min   = static_cast<uint8_t>(utcTm.tm_min);
+    const uint16_t slots = static_cast<uint16_t>(utcTm.tm_sec * 135);
+
+    uint8_t b[8]{};
+    b[0] = 0x00;
+    b[1] = static_cast<uint8_t>((us << 3) | (ist << 2) | (mm << 1) | ((mc >> 1) & 0x01));
+    b[2] = static_cast<uint8_t>(((mc & 0x01) << 7) | (vl << 6) | ltoff);
+    b[3] = static_cast<uint8_t>((year << 1) | ((month >> 3) & 0x01));
+    b[4] = static_cast<uint8_t>(((month & 0x07) << 5) | (day & 0x1F));
+    b[5] = static_cast<uint8_t>(((hour & 0x1F) << 3) | ((min >> 3) & 0x07));
+    b[6] = static_cast<uint8_t>(((min & 0x07) << 5) | ((slots >> 8) & 0x1F));
+    b[7] = static_cast<uint8_t>(slots & 0xFF);
+
+    uint64_t args = 0;
+    for (int i = 0; i < 8; ++i)
+        args = (args << 8) | b[i];
+
+    return buildTSBK(true, TSBK_SYNC_BCAST, 0x00, args);
 }
 
 } // namespace p25

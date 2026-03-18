@@ -10,6 +10,7 @@ constexpr uint8_t TSBK_GRP_VCH_GRANT_UPD = 0x02;
 constexpr uint8_t TSBK_GRP_AFF_RSP       = 0x28;
 constexpr uint8_t TSBK_LOC_REG_RSP       = 0x2B;
 constexpr uint8_t TSBK_U_REG_RSP         = 0x2C;
+constexpr uint8_t TSBK_SYNC_BCAST        = 0x30;
 constexpr uint8_t TSBK_RFSS_STS_BCAST    = 0x3A;
 constexpr uint8_t TSBK_NET_STS_BCAST     = 0x3B;
 constexpr uint8_t TSBK_ADJ_STS_BCAST     = 0x3C;
@@ -56,5 +57,8 @@ std::array<uint8_t, 12> BuildURegRsp(bool accepted, uint16_t sysID,
 
 std::array<uint8_t, 12> BuildAdjStsBcast(uint16_t adjSysID, uint8_t rfssID, uint8_t siteID,
                                           uint16_t chanID, uint16_t chanNum, uint8_t ssc);
+
+// SYNC_BCAST (0x30): broadcasts current UTC date/time and local offset.
+std::array<uint8_t, 12> BuildSyncBcast();
 
 } // namespace p25
