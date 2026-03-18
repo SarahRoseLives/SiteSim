@@ -38,6 +38,20 @@ set(SITESIM_SOURCES
 
 add_executable(sitesim ${SITESIM_SOURCES})
 
+set(SITESIM_CORE_SOURCES
+    src/p25/TSBK.cpp
+    src/p25/Frame.cpp
+    src/p25/C4FM.cpp
+    src/tx/SoapyTx.cpp
+    src/tx/ControlChannel.cpp
+    src/rx/RxPipeline.cpp
+)
+
+add_executable(uplink_test
+    src/uplink_test_main.cpp
+    ${SITESIM_CORE_SOURCES}
+)
+
 target_include_directories(sitesim PRIVATE
     src/
     ${IMGUI_DIR}
@@ -45,6 +59,12 @@ target_include_directories(sitesim PRIVATE
     ${NLOHMANN_DIR}
     ${SOAPY_INCLUDE_DIRS}
     ${SDL2_INCLUDE_DIRS}
+    /usr/local/include
+)
+
+target_include_directories(uplink_test PRIVATE
+    src/
+    ${SOAPY_INCLUDE_DIRS}
     /usr/local/include
 )
 
@@ -67,8 +87,30 @@ target_link_libraries(sitesim PRIVATE
     rtlsdr
 )
 
+target_link_libraries(uplink_test PRIVATE
+    ${SOAPY_LIBRARIES}
+    dl
+    -L/usr/local/lib
+    -Wl,--allow-shlib-undefined
+    dsd-neo_engine
+    dsd-neo_dispatch
+    dsd-neo_core
+    dsd-neo_runtime
+    dsd-neo_proto_p25
+    dsd-neo_io_radio
+    dsd-neo_io_control
+    dsd-neo_io_audio
+    mbe-neo
+    rtlsdr
+)
+
 target_compile_options(sitesim PRIVATE
     ${SOAPY_CFLAGS_OTHER}
     ${SDL2_CFLAGS_OTHER}
+    -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
+)
+
+target_compile_options(uplink_test PRIVATE
+    ${SOAPY_CFLAGS_OTHER}
     -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
 )
