@@ -52,16 +52,78 @@ type HackRF struct {
 	dev *C.hackrf_device
 }
 
-// OpenHackRF initialises libhackrf and opens the first available device.
-func OpenHackRF() (*HackRF, error) {
+type HackRFDeviceInfo struct {
+	Index  int
+	Serial string
+}
+
+func ListHackRFDevices() ([]HackRFDeviceInfo, error) {
 	if ret := C.hackrf_init(); ret != C.HACKRF_SUCCESS {
 		return nil, fmt.Errorf("hackrf_init: code %d", int(ret))
 	}
-	var dev *C.hackrf_device
-	if ret := C.hackrf_open(&dev); ret != C.HACKRF_SUCCESS {
-		C.hackrf_exit()
-		return nil, fmt.Errorf("hackrf_open: code %d — is HackRF connected?", int(ret))
+	defer C.hackrf_exit()
+
+	list := C.hackrf_device_list()
+	if list == nil {
+		return nil, fmt.Errorf("hackrf_device_list returned nil")
 	}
+	defer C.hackrf_device_list_free(list)
+
+	count := int(list.devicecount)
+	devices := make([]HackRFDeviceInfo, 0, count)
+	serials := unsafe.Slice(list.serial_numbers, count)
+	for i := 0; i < count; i++ {
+		serial := ""
+		if serials[i] != nil {
+			serial = C.GoString(serials[i])
+		}
+		devices = append(devices, HackRFDeviceInfo{
+			Index:  i,
+			Serial: serial,
+		})
+	}
+	return devices, nil
+}
+
+// OpenHackRF initialises libhackrf and opens the requested device.
+// serial takes priority over index. Use index < 0 to select the default device.
+func OpenHackRF(serial string, index int) (*HackRF, error) {
+	if ret := C.hackrf_init(); ret != C.HACKRF_SUCCESS {
+		return nil, fmt.Errorf("hackrf_init: code %d", int(ret))
+	}
+
+	var dev *C.hackrf_device
+
+	switch {
+	case serial != "":
+		cserial := C.CString(serial)
+		defer C.free(unsafe.Pointer(cserial))
+		if ret := C.hackrf_open_by_serial(cserial, &dev); ret != C.HACKRF_SUCCESS {
+			C.hackrf_exit()
+			return nil, fmt.Errorf("hackrf_open_by_serial(%q): code %d", serial, int(ret))
+		}
+	case index >= 0:
+		list := C.hackrf_device_list()
+		if list == nil {
+			C.hackrf_exit()
+			return nil, fmt.Errorf("hackrf_device_list returned nil")
+		}
+		defer C.hackrf_device_list_free(list)
+		if index >= int(list.devicecount) {
+			C.hackrf_exit()
+			return nil, fmt.Errorf("device index %d out of range (found %d device(s))", index, int(list.devicecount))
+		}
+		if ret := C.hackrf_device_list_open(list, C.int(index), &dev); ret != C.HACKRF_SUCCESS {
+			C.hackrf_exit()
+			return nil, fmt.Errorf("hackrf_device_list_open(%d): code %d", index, int(ret))
+		}
+	default:
+		if ret := C.hackrf_open(&dev); ret != C.HACKRF_SUCCESS {
+			C.hackrf_exit()
+			return nil, fmt.Errorf("hackrf_open: code %d — is HackRF connected?", int(ret))
+		}
+	}
+
 	return &HackRF{dev: dev}, nil
 }
 

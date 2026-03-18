@@ -39,6 +39,9 @@ func main() {
 	count    := fs.Int("count",  48,       "Number of frame repetitions")
 	gain     := fs.Int("gain",   40,       "TX VGA gain dB (0–47)")
 	amp      := fs.Bool("amp",   false,    "Enable HackRF built-in amplifier")
+	device   := fs.Int("device", -1,       "HackRF device index to use")
+	serial   := fs.String("serial", "",    "HackRF serial number to use")
+	listDevs := fs.Bool("list",   false,    "List available HackRF devices and exit")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "P25 ISP packet transmitter for HackRF\n\n")
@@ -58,9 +61,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	if *listDevs {
+		devices, err := ListHackRFDevices()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to list HackRF devices: %v\n", err)
+			os.Exit(1)
+		}
+		if len(devices) == 0 {
+			fmt.Println("No HackRF devices found.")
+			return
+		}
+		for _, d := range devices {
+			fmt.Printf("[%d] %s\n", d.Index, d.Serial)
+		}
+		return
+	}
+
 	cmd := fs.Arg(0)
 	if cmd == "" {
 		fs.Usage()
+		os.Exit(1)
+	}
+	if *serial != "" && *device >= 0 {
+		fmt.Fprintln(os.Stderr, "Use either -serial or -device, not both")
 		os.Exit(1)
 	}
 
@@ -110,6 +133,11 @@ func main() {
 	fmt.Printf("SysID  : 0x%03X\n", *sysID)
 	fmt.Printf("Freq   : %.4f MHz\n", *freqMHz)
 	fmt.Printf("Gain   : %d dB VGA  amp=%v\n", *gain, *amp)
+	if *serial != "" {
+		fmt.Printf("HackRF : serial=%s\n", *serial)
+	} else if *device >= 0 {
+		fmt.Printf("HackRF : device=%d\n", *device)
+	}
 	fmt.Printf("Reps   : %d\n\n", *count)
 
 	fmt.Printf("TSBK bytes: ")
@@ -129,7 +157,7 @@ func main() {
 
 	// ── Open HackRF and transmit ──────────────────────────────────────────
 	fmt.Print("Opening HackRF... ")
-	hrf, err := OpenHackRF()
+	hrf, err := OpenHackRF(*serial, *device)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FAIL: %v\n", err)
 		os.Exit(1)
