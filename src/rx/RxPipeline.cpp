@@ -51,8 +51,9 @@ bool RxPipeline::start()
     m_opts->audio_in_type       = AUDIO_IN_RTL;
     snprintf(m_opts->audio_in_dev, sizeof(m_opts->audio_in_dev), "rtl");
     m_opts->rtlsdr_center_freq  = static_cast<uint32_t>(m_cfg.rxFreqHz());
-    m_opts->rtl_gain_value      = 300;   // 30.0 dB (tenths of dB)
-    m_opts->rtl_dsp_bw_khz      = 12;
+    m_opts->rtl_gain_value      = 0;     // 0 = AGC (auto-gain)
+    m_opts->rtlsdr_ppm_error    = 0;     // no manual PPM correction
+    m_opts->rtl_dsp_bw_khz      = 24;    // 24 kHz -> 5 samples/symbol for P25P1
     m_opts->rtl_dev_index       = 0;
 
     // ── P25 Phase 1 only — disable all other protocols to prevent crashes ──
