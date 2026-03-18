@@ -1,4 +1,5 @@
 #include "rx/RxPipeline.hpp"
+#include "p25/TSBK.hpp"
 
 #include <dsd-neo/core/init.h>
 #include <dsd-neo/core/opts.h>
@@ -157,16 +158,8 @@ void RxPipeline::handleIspTsbk(uint8_t opcode, const uint8_t raw12[12])
 
     case P25_ISP_GRP_AFF_Q: {
         // Acknowledge affiliation; queue GRP_AFF_RSP
-        std::array<uint8_t, 12> rsp{};
-        // GRP_AFF_RSP (OSP 0x28): [0]=0x28, [1]=0x00(MFID), [2]=options,
-        //   [3]=0, [4]=0, [5-6]=TGID, [7-9]=SRC, [10-11]=CRC (filled by TSBK layer)
-        rsp[0] = 0x28;
-        rsp[2] = 0x00;                                   // announce group
-        rsp[5] = (tgid >> 8) & 0xFF;
-        rsp[6] =  tgid       & 0xFF;
-        rsp[7] = (src_id >> 16) & 0xFF;
-        rsp[8] = (src_id >>  8) & 0xFF;
-        rsp[9] =  src_id        & 0xFF;
+        auto rsp = p25::BuildGrpAffRsp(false, 0, static_cast<uint16_t>(tgid),
+                                       static_cast<uint16_t>(tgid), src_id);
         m_cc.queueTSBK(rsp);
 
         snprintf(buf, sizeof(buf), "GRP_AFF_REQ  SRC:%-8u TGID:%-5u -> queued AFF_RSP", src_id, tgid);
@@ -176,16 +169,7 @@ void RxPipeline::handleIspTsbk(uint8_t opcode, const uint8_t raw12[12])
 
     case P25_ISP_U_REG_REQ: {
         // Queue Unit Registration Response
-        std::array<uint8_t, 12> rsp{};
-        // U_REG_RSP (OSP 0x2C): [0]=0x2C, [1]=0x00, [2]=0(result), [3-4]=SysID,
-        //   [7-9]=Source ID
-        rsp[0] = 0x2C;
-        rsp[2] = 0x00;                                   // registration accepted
-        rsp[3] = (m_cfg.sysid >> 4) & 0xFF;
-        rsp[4] = (m_cfg.sysid & 0x0F) << 4;
-        rsp[7] = (src_id >> 16) & 0xFF;
-        rsp[8] = (src_id >>  8) & 0xFF;
-        rsp[9] =  src_id        & 0xFF;
+        auto rsp = p25::BuildURegRsp(true, m_cfg.sysid, src_id, src_id);
         m_cc.queueTSBK(rsp);
 
         snprintf(buf, sizeof(buf), "U_REG_REQ    SRC:%-8u -> queued U_REG_RSP", src_id);
