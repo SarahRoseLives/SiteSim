@@ -1,0 +1,373 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * Regression test: UDP PCM16LE input must be sample-accurate and must not
+ * synthesize samples when idle (it should block until data arrives).
+ */
+
+#include <dsd-neo/core/opts.h>
+#include <dsd-neo/io/udp_input.h>
+#include <dsd-neo/platform/platform.h>
+#include <dsd-neo/platform/sockets.h>
+#include <dsd-neo/platform/threading.h>
+#include <dsd-neo/runtime/exitflag.h>
+#include <errno.h>
+#if !DSD_PLATFORM_WIN_NATIVE
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
+#include <stdint.h>
+#include <stdio.h>
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/safe_api.h"
+#include "dsd-neo/dsp/resampler.h"
+
+static int
+expect_int(const char* label, int got, int want) {
+    if (got != want) {
+        DSD_FPRINTF(stderr, "%s: got %d want %d\n", label, got, want);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+get_bound_port(dsd_socket_t sock) {
+    struct sockaddr_in sa;
+#if DSD_PLATFORM_WIN_NATIVE
+    int slen = (int)sizeof(sa);
+#else
+    socklen_t slen = (socklen_t)sizeof(sa);
+#endif
+    DSD_MEMSET(&sa, 0, sizeof(sa));
+    if (getsockname(sock, (struct sockaddr*)&sa, &slen) != 0) {
+        return -1;
+    }
+    if (sa.sin_family != AF_INET) {
+        return -1;
+    }
+    return (int)ntohs(sa.sin_port);
+}
+
+static int
+send_pcm16le(dsd_socket_t sock, const char* host, int port, const int16_t* samples, size_t nsamp) {
+    uint8_t buf[2048];
+    if (nsamp * 2 > sizeof(buf)) {
+        return -1;
+    }
+    for (size_t i = 0; i < nsamp; i++) {
+        uint16_t u = (uint16_t)samples[i];
+        buf[i * 2 + 0] = (uint8_t)(u & 0xFFu);
+        buf[i * 2 + 1] = (uint8_t)((u >> 8) & 0xFFu);
+    }
+
+    struct sockaddr_in dst;
+    DSD_MEMSET(&dst, 0, sizeof(dst));
+    if (dsd_socket_resolve(host, port, &dst) != 0) {
+        return -1;
+    }
+    int n = dsd_socket_sendto(sock, buf, nsamp * 2, 0, (struct sockaddr*)&dst, (int)sizeof(dst));
+    return (n == (int)(nsamp * 2)) ? 0 : -1;
+}
+
+static dsd_socket_t
+bind_loopback_ephemeral(int* out_port) {
+    if (!out_port) {
+        return DSD_INVALID_SOCKET;
+    }
+    *out_port = -1;
+
+    dsd_socket_t sock = dsd_socket_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == DSD_INVALID_SOCKET) {
+        return DSD_INVALID_SOCKET;
+    }
+
+    struct sockaddr_in addr;
+    DSD_MEMSET(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = 0;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (dsd_socket_bind(sock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        dsd_socket_close(sock);
+        return DSD_INVALID_SOCKET;
+    }
+
+    int port = get_bound_port(sock);
+    if (port <= 0) {
+        dsd_socket_close(sock);
+        return DSD_INVALID_SOCKET;
+    }
+    *out_port = port;
+    return sock;
+}
+
+typedef struct reader_state {
+    dsd_opts* opts;
+    dsd_mutex_t mu;
+    dsd_cond_t cv;
+    int done;
+    int ok;
+    int16_t sample;
+} reader_state;
+
+static DSD_THREAD_RETURN_TYPE
+#if DSD_PLATFORM_WIN_NATIVE
+    __stdcall
+#endif
+    reader_thread(void* arg) {
+    reader_state* rs = (reader_state*)arg;
+    int16_t s = 0;
+    int ok = udp_input_read_sample(rs->opts, &s);
+
+    dsd_mutex_lock(&rs->mu);
+    rs->done = 1;
+    rs->ok = ok;
+    rs->sample = s;
+    dsd_cond_signal(&rs->cv);
+    dsd_mutex_unlock(&rs->mu);
+
+    DSD_THREAD_RETURN;
+}
+
+static int
+wait_done(reader_state* rs, unsigned int timeout_ms) {
+    int ret = 0;
+    dsd_mutex_lock(&rs->mu);
+    while (!rs->done && ret != ETIMEDOUT) {
+        ret = dsd_cond_timedwait(&rs->cv, &rs->mu, timeout_ms);
+    }
+    int done = rs->done;
+    dsd_mutex_unlock(&rs->mu);
+    return done;
+}
+
+static int
+stage_dirty_input_state(dsd_opts* opts) {
+    if (!opts || !dsd_resampler_design(&opts->input_resampler, 6, 1)) {
+        return 0;
+    }
+    opts->input_upsample_prev = 123.0f;
+    opts->input_upsample_len = 4;
+    opts->input_upsample_pos = 2;
+    opts->input_upsample_prev_valid = 1;
+    for (size_t i = 0; i < sizeof(opts->input_upsample_buf) / sizeof(opts->input_upsample_buf[0]); i++) {
+        opts->input_upsample_buf[i] = (float)(i + 1);
+    }
+    return 1;
+}
+
+static int
+input_stage_was_reset(const dsd_opts* opts) {
+    if (!opts) {
+        return 0;
+    }
+    if (opts->input_resampler.enabled != 0 || opts->input_resampler.L != 1 || opts->input_resampler.M != 1
+        || opts->input_resampler.taps != NULL || opts->input_resampler.hist != NULL) {
+        return 0;
+    }
+    if (opts->input_upsample_prev != 0.0f || opts->input_upsample_len != 0 || opts->input_upsample_pos != 0
+        || opts->input_upsample_prev_valid != 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < sizeof(opts->input_upsample_buf) / sizeof(opts->input_upsample_buf[0]); i++) {
+        if (opts->input_upsample_buf[i] != 0.0f) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int
+test_startup_contracts(void) {
+    int rc = 0;
+    int16_t sample = 0;
+    dsd_socket_t reserved = DSD_INVALID_SOCKET;
+
+    udp_input_stop(NULL);
+    rc |= expect_int("read rejects null opts", udp_input_read_sample(NULL, &sample), 0);
+
+    static dsd_opts invalid;
+    DSD_MEMSET(&invalid, 0, sizeof(invalid));
+    invalid.wav_sample_rate = 48000;
+    rc |= expect_int("read rejects missing context", udp_input_read_sample(&invalid, &sample), 0);
+    rc |= expect_int("read rejects null sample output", udp_input_read_sample(&invalid, NULL), 0);
+    rc |= expect_int("start rejects null opts", udp_input_start(NULL, "127.0.0.1", 0, 48000), -1);
+    rc |= expect_int("start rejects invalid bind address", udp_input_start(&invalid, "not-a-numeric-address", 0, 48000),
+                     -1);
+
+    int reserved_port = -1;
+    reserved = bind_loopback_ephemeral(&reserved_port);
+    if (reserved == DSD_INVALID_SOCKET) {
+        DSD_FPRINTF(stderr, "failed to reserve loopback UDP port for bind-failure contract\n");
+        return 1;
+    }
+    rc |= expect_int("start rejects already-bound UDP port",
+                     udp_input_start(&invalid, "127.0.0.1", reserved_port, 48000), -1);
+    dsd_socket_close(reserved);
+    reserved = DSD_INVALID_SOCKET;
+
+    static dsd_opts any;
+    DSD_MEMSET(&any, 0, sizeof(any));
+    any.wav_sample_rate = 48000;
+    if (udp_input_start(&any, "0.0.0.0", 0, 96000) != 0) {
+        DSD_FPRINTF(stderr, "start on INADDR_ANY failed\n");
+        rc = 1;
+    } else {
+        void* first_ctx = any.udp_in_ctx;
+        dsd_socket_t first_sock = any.udp_in_sockfd;
+        rc |= expect_int("already-started start is no-op", udp_input_start(&any, "127.0.0.1", 0, 48000), 0);
+        if (any.udp_in_ctx != first_ctx || any.udp_in_sockfd != first_sock) {
+            DSD_FPRINTF(stderr, "already-started start replaced UDP input context\n");
+            rc = 1;
+        }
+        rc |= expect_int("read rejects null output on active context", udp_input_read_sample(&any, NULL), 0);
+        exitflag = 1;
+        rc |= expect_int("read exits when shutdown flag is set", udp_input_read_sample(&any, &sample), 0);
+        exitflag = 0;
+        udp_input_stop(&any);
+    }
+
+    static dsd_opts loopback_default;
+    DSD_MEMSET(&loopback_default, 0, sizeof(loopback_default));
+    loopback_default.wav_sample_rate = 48000;
+    if (udp_input_start(&loopback_default, "", 0, 48000) != 0) {
+        DSD_FPRINTF(stderr, "start with empty bind address failed\n");
+        rc = 1;
+    } else {
+        udp_input_stop(&loopback_default);
+    }
+
+    if (reserved != DSD_INVALID_SOCKET) {
+        dsd_socket_close(reserved);
+    }
+    return rc;
+}
+
+int
+main(void) {
+    exitflag = 0;
+    if (dsd_socket_init() != 0) {
+        DSD_FPRINTF(stderr, "dsd_socket_init failed\n");
+        return 1;
+    }
+
+    int rc = 1;
+    int started = 0;
+    dsd_socket_t tx = DSD_INVALID_SOCKET;
+    dsd_thread_t th = (dsd_thread_t)0;
+    int th_started = 0;
+    int rs_inited = 0;
+
+    if (test_startup_contracts() != 0) {
+        goto cleanup;
+    }
+
+    static dsd_opts opts;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    opts.wav_sample_rate = 48000;
+    if (!stage_dirty_input_state(&opts)) {
+        DSD_FPRINTF(stderr, "failed to dirty staged input state\n");
+        goto cleanup;
+    }
+
+    /*
+     * Start on an ephemeral loopback port, send real PCM frames, and prove the
+     * UDP path resets staged file/resampler state before samples are consumed.
+     * The reader-thread section then verifies the no-data path blocks cleanly.
+     */
+    if (udp_input_start(&opts, "127.0.0.1", 0, opts.wav_sample_rate) != 0) {
+        DSD_FPRINTF(stderr, "udp_input_start failed\n");
+        goto cleanup;
+    }
+    started = 1;
+    if (!input_stage_was_reset(&opts)) {
+        DSD_FPRINTF(stderr, "udp_input_start did not reset staged PCM input state\n");
+        goto cleanup;
+    }
+
+    int port = get_bound_port(opts.udp_in_sockfd);
+    if (port <= 0) {
+        DSD_FPRINTF(stderr, "failed to determine bound UDP port\n");
+        goto cleanup;
+    }
+
+    tx = dsd_socket_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (tx == DSD_INVALID_SOCKET) {
+        DSD_FPRINTF(stderr, "failed to create UDP sender socket\n");
+        goto cleanup;
+    }
+
+    const int16_t v[] = {0, 1, -1, INT16_MAX, INT16_MIN, 1234, -1234, 2222, -2222};
+    if (send_pcm16le(tx, "127.0.0.1", port, v, sizeof(v) / sizeof(v[0])) != 0) {
+        DSD_FPRINTF(stderr, "failed to send initial UDP PCM\n");
+        goto cleanup;
+    }
+
+    for (size_t i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
+        int16_t out = 0;
+        if (!udp_input_read_sample(&opts, &out)) {
+            DSD_FPRINTF(stderr, "udp_input_read_sample returned shutdown unexpectedly\n");
+            goto cleanup;
+        }
+        if (out != v[i]) {
+            DSD_FPRINTF(stderr, "sample mismatch at %zu: got %d expected %d\n", i, (int)out, (int)v[i]);
+            goto cleanup;
+        }
+    }
+
+    // With no new packets, udp_input_read_sample should block rather than emit silence.
+    reader_state rs;
+    DSD_MEMSET(&rs, 0, sizeof(rs));
+    rs.opts = &opts;
+    dsd_mutex_init(&rs.mu);
+    dsd_cond_init(&rs.cv);
+    rs_inited = 1;
+
+    if (dsd_thread_create(&th, reader_thread, &rs) != 0) {
+        DSD_FPRINTF(stderr, "failed to create reader thread\n");
+        goto cleanup;
+    }
+    th_started = 1;
+
+    if (wait_done(&rs, 50)) {
+        DSD_FPRINTF(stderr, "udp_input_read_sample returned without data (should block)\n");
+        goto cleanup;
+    }
+
+    const int16_t last = (int16_t)0x1357;
+    if (send_pcm16le(tx, "127.0.0.1", port, &last, 1) != 0) {
+        DSD_FPRINTF(stderr, "failed to send unblock sample\n");
+        goto cleanup;
+    }
+
+    if (!wait_done(&rs, 500)) {
+        DSD_FPRINTF(stderr, "reader did not unblock after data arrival\n");
+        goto cleanup;
+    }
+
+    if (!rs.ok || rs.sample != last) {
+        DSD_FPRINTF(stderr, "unblock sample mismatch: ok=%d got=%d expected=%d\n", rs.ok, (int)rs.sample, (int)last);
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    if (th_started) {
+        exitflag = 1;
+        (void)dsd_thread_join(th);
+    }
+    if (rs_inited) {
+        dsd_cond_destroy(&rs.cv);
+        dsd_mutex_destroy(&rs.mu);
+    }
+    if (tx != DSD_INVALID_SOCKET) {
+        dsd_socket_close(tx);
+    }
+    if (started) {
+        udp_input_stop(&opts);
+    }
+    dsd_resampler_reset(&opts.input_resampler);
+    dsd_socket_cleanup();
+    return rc;
+}

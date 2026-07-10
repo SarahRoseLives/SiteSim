@@ -1,0 +1,279 @@
+rules:
+  - id: dsd-neo.no-raw-memory-api
+    languages: [c, cpp]
+    severity: ERROR
+    message: Use the dsd-neo safe API wrapper instead of the raw C memory/string API.
+    paths:
+      include:
+        - /apps/**
+        - /include/**
+        - /src/**
+        - /tests/**
+      exclude:
+        - /include/dsd-neo/core/safe_api.h
+        - /src/third_party/**
+    pattern-either:
+      - pattern: memcpy(...)
+      - pattern: memmove(...)
+      - pattern: memset(...)
+      - pattern: strcpy(...)
+      - pattern: strncpy(...)
+      - pattern: strcat(...)
+      - pattern: strncat(...)
+      - pattern: sprintf(...)
+      - pattern: snprintf(...)
+      - pattern: fprintf(...)
+      - pattern: sscanf(...)
+
+  - id: dsd-neo.no-shell-exec
+    languages: [c, cpp]
+    severity: ERROR
+    message: Do not invoke shells or spawn processes from project-owned C/C++ code without explicit design review.
+    paths:
+      include:
+        - /apps/**
+        - /include/**
+        - /src/**
+        - /tests/**
+      exclude:
+        - /src/third_party/**
+    pattern-either:
+      - pattern: system(...)
+      - pattern: popen(...)
+      - pattern: execl(...)
+      - pattern: execle(...)
+      - pattern: execlp(...)
+      - pattern: execv(...)
+      - pattern: execve(...)
+      - pattern: execvp(...)
+      - pattern: posix_spawn(...)
+      - pattern: posix_spawnp(...)
+
+  - id: dsd-neo.no-static-array-parameter-bounds
+    languages: [generic]
+    severity: ERROR
+    message: >
+      Do not use C99 array parameter static bounds; MSVC rejects this syntax. Use an ordinary pointer or array
+      declarator for portable project-owned C/C++ declarations.
+    paths:
+      include:
+        - /apps/**
+        - /include/**
+        - /src/**
+        - /tests/**
+      exclude:
+        - /src/third_party/**
+    pattern-regex: '\[\s*static\b'
+
+  - id: dsd-neo.no-automatic-full-decoder-state
+    languages: [generic]
+    severity: ERROR
+    message: >
+      Do not allocate dsd_state or dsd_opts as automatic locals; use heap allocation or intentional static storage so
+      large decoder objects never consume stack space.
+    paths:
+      include:
+        - /apps/**
+        - /include/**
+        - /src/**
+        - /tests/**
+      exclude:
+        - /src/third_party/**
+    pattern-regex: '^\s*(?!(?:static|thread_local)\b)(?:(?:const\s+)?(?:struct\s+)?(?:dsd_state|dsd_opts)\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:=|\{|,|\[|;)|(?:const\s+)?auto\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:dsd_state|dsd_opts)\s*(?:\{|\())'
+
+  - id: dsd-neo.no-production-assert
+    languages: [c, cpp]
+    severity: ERROR
+    message: >
+      Use explicit runtime validation or unreachable handling in production code instead of assert(), which can compile
+      out under NDEBUG.
+    paths:
+      include:
+        - /apps/**
+        - /include/**
+        - /src/**
+      exclude:
+        - /src/third_party/**
+    pattern: assert(...)
+
+  - id: dsd-neo.no-weak-process-rng
+    languages: [c, cpp]
+    severity: ERROR
+    message: >
+      Do not use process-global rand()/srand(); use a purpose-specific RNG, nonce, or unique-name helper.
+    paths:
+      include:
+        - /apps/**
+        - /include/**
+        - /src/**
+      exclude:
+        - /src/third_party/**
+    pattern-either:
+      - pattern: rand(...)
+      - pattern: srand(...)
+
+  - id: dsd-neo.no-atoi-family
+    languages: [c, cpp]
+    severity: ERROR
+    message: Use checked strto* parsing or a project parse helper instead of atoi/atol/atoll/atof.
+    paths:
+      include:
+        - /apps/**
+        - /include/**
+        - /src/**
+      exclude:
+        - /src/third_party/**
+    pattern-either:
+      - pattern: atoi(...)
+      - pattern: atol(...)
+      - pattern: atoll(...)
+      - pattern: atof(...)
+      - pattern: std::atoi(...)
+      - pattern: std::atol(...)
+      - pattern: std::atoll(...)
+      - pattern: std::atof(...)
+
+  - id: dsd-neo.no-unchecked-strto-endptr
+    languages: [c, cpp]
+    severity: ERROR
+    message: Check the strto* end pointer and range instead of passing NULL for endptr.
+    paths:
+      include:
+        - /apps/**
+        - /include/**
+        - /src/**
+      exclude:
+        - /src/third_party/**
+    pattern-either:
+      - pattern: strtol($S, NULL, $B)
+      - pattern: strtoul($S, NULL, $B)
+      - pattern: strtoll($S, NULL, $B)
+      - pattern: strtoull($S, NULL, $B)
+      - pattern: strtod($S, NULL)
+      - pattern: strtof($S, NULL)
+      - pattern: strtol($S, nullptr, $B)
+      - pattern: strtoul($S, nullptr, $B)
+      - pattern: strtoll($S, nullptr, $B)
+      - pattern: strtoull($S, nullptr, $B)
+      - pattern: strtod($S, nullptr)
+      - pattern: strtof($S, nullptr)
+      - pattern: std::strtol($S, NULL, $B)
+      - pattern: std::strtoul($S, NULL, $B)
+      - pattern: std::strtoll($S, NULL, $B)
+      - pattern: std::strtoull($S, NULL, $B)
+      - pattern: std::strtod($S, NULL)
+      - pattern: std::strtof($S, NULL)
+      - pattern: std::strtol($S, nullptr, $B)
+      - pattern: std::strtoul($S, nullptr, $B)
+      - pattern: std::strtoll($S, nullptr, $B)
+      - pattern: std::strtoull($S, nullptr, $B)
+      - pattern: std::strtod($S, nullptr)
+      - pattern: std::strtof($S, nullptr)
+
+  - id: dsd-neo.no-raw-file-open
+    languages: [c, cpp]
+    severity: ERROR
+    message: Use project file/path compatibility helpers instead of raw file open/temp APIs in project-owned code.
+    paths:
+      include:
+        - /apps/**
+        - /include/**
+        - /src/**
+      exclude:
+        - /src/third_party/**
+        - /src/platform/file_compat_posix.c
+        - /src/platform/file_compat_win32.c
+        - /src/platform/posix_compat_posix.c
+        - /src/platform/posix_compat_win32.c
+        - /src/runtime/path_policy.c
+    pattern-either:
+      - pattern: fopen(...)
+      - pattern: freopen(...)
+      - pattern: open(...)
+      - pattern: creat(...)
+      - pattern: tmpfile(...)
+      - pattern: tmpnam(...)
+      - pattern: mktemp(...)
+      - pattern: mkstemp(...)
+      - pattern: mkstemps(...)
+
+  - id: dsd-neo.no-deprecated-dsd-sprintf
+    languages: [c, cpp]
+    severity: ERROR
+    message: Use DSD_SNPRINTF with an explicit destination size instead of deprecated DSD_SPRINTF.
+    paths:
+      include:
+        - /apps/**
+        - /include/**
+        - /src/**
+        - /tests/**
+      exclude:
+        - /include/dsd-neo/core/safe_api.h
+        - /src/third_party/**
+    pattern: DSD_SPRINTF(...)
+
+  - id: dsd-neo.no-sizeof-function-parameter-in-dsd-snprintf
+    languages: [c, cpp]
+    severity: ERROR
+    message: Function parameters have pointer size in C; pass the explicit destination capacity to DSD_SNPRINTF.
+    paths:
+      include:
+        - /apps/**
+        - /include/**
+        - /src/**
+        - /tests/**
+      exclude:
+        - /include/dsd-neo/core/safe_api.h
+        - /src/third_party/**
+    pattern-either:
+      - patterns:
+          - pattern-inside: |
+              $RET $FUNC(..., $TYPE *$DST, ...) {
+                ...
+              }
+          - pattern: DSD_SNPRINTF($DST, sizeof($DST), ...)
+      - patterns:
+          - pattern-inside: |
+              $RET $FUNC(..., $TYPE $DST[$N], ...) {
+                ...
+              }
+          - pattern: DSD_SNPRINTF($DST, sizeof($DST), ...)
+
+  - id: dsd-neo.no-direct-third-party-include
+    languages: [c, cpp]
+    severity: ERROR
+    message: Use a project-owned wrapper/target instead of directly including bundled third-party headers.
+    paths:
+      include:
+        - /apps/**
+        - /include/**
+        - /src/**
+        - /tests/**
+      exclude:
+        - /src/third_party/**
+        - /src/fec/ez.cpp
+        - /src/io/radio/rtl_metrics.cpp
+        - /tests/protocol/p25/test_p25_p2_rs28_limits.cpp
+        - /tests/protocol/p25/test_p25_p2_rs28_wrappers.cpp
+    pattern-either:
+      - pattern: '#include "src/third_party/..."'
+      - pattern: '#include <src/third_party/...>'
+      - pattern: '#include "ezpwd/..."'
+      - pattern: '#include <ezpwd/...>'
+      - pattern: '#include "pffft.h"'
+      - pattern: '#include <pffft.h>'
+
+  - id: dsd-neo.github-actions.no-untrusted-context-in-run
+    languages: [yaml]
+    severity: ERROR
+    message: Pass untrusted GitHub context through env or action inputs instead of interpolating it directly into a run block.
+    paths:
+      include:
+        - /.github/workflows/*.yml
+        - /.github/workflows/*.yaml
+    patterns:
+      - pattern: |
+          run: $SCRIPT
+      - metavariable-regex:
+          metavariable: $SCRIPT
+          regex: '(?s).*\$\{\{\s*github\.(?:head_ref|ref_name|event\.(?:issue\.(?:title|body)|comment\.body|pull_request\.(?:title|body)|pull_request\.head\.(?:ref|label)|pull_request\.head\.repo\.full_name)).*'

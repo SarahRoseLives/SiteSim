@@ -1,0 +1,748 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
+ */
+
+/**
+ * @file
+ * @brief RTL-SDR metrics, spectrum diagnostics, and auto-PPM helpers.
+ *
+ * Houses auto-PPM supervision state, spectrum and carrier diagnostics, and the
+ * public query/toggle helpers used by the UI and protocol code.
+ */
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <dsd-neo/dsp/demod_state.h>
+#include <dsd-neo/dsp/ted.h>
+#include <dsd-neo/io/rtl_metrics.h>
+#include <dsd-neo/io/rtl_stream_c.h>
+#include <pffft.h>
+#include <string.h>
+
+#include "rtl_stream_shared.hpp"
+
+/* Spectrum capture and carrier diagnostics shared with RTL orchestrator. */
+static const int kSpecMaxN = 1024; /* Max FFT size (power of two) */
+static float g_spec_db[kSpecMaxN];
+static std::atomic<int> g_spec_rate_hz{0};
+static std::atomic<int> g_spec_ready{0};
+static std::atomic<int> g_spec_N{256}; /* default N */
+std::atomic<double> g_spec_peak_db{-100.0};
+std::atomic<double> g_spec_snr_db{-100.0};
+/* Carrier diagnostics (updated alongside spectrum) */
+static std::atomic<double> g_cfo_nco_hz{0.0};
+static std::atomic<double> g_resid_cfo_spec_hz{0.0};
+std::atomic<double> g_resid_cfo_phase_hz{0.0};
+static std::atomic<int> g_carrier_lock{0};
+static std::atomic<int> g_nco_q15{0};
+static std::atomic<int> g_demod_rate_hz{0};
+static std::atomic<int> g_costas_err_avg_q14{0};
+static std::atomic<int> g_costas_err_raw_avg_q14{0};
+static std::atomic<int> g_costas_conf_avg_q14{0};
+static std::atomic<int> g_costas_zero_conf_pct{0};
+static std::atomic<double> g_fll_band_edge_freq_rad{0.0}; /* FLL band-edge NCO freq (rad/sample) */
+
+/* Supervisory tuner autogain gate (0/1), controlled via env/UI. */
+std::atomic<int> g_tuner_autogain_on{0};
+
+/* Auto-PPM status. */
+std::atomic<int> g_auto_ppm_enabled{0};
+/* User override for auto-PPM: -1 = follow env/opts; 0 = force off; 1 = force on. */
+std::atomic<int> g_auto_ppm_user_en{-1};
+std::atomic<int> g_auto_ppm_locked{0};
+std::atomic<int> g_auto_ppm_training{0};
+std::atomic<int> g_auto_ppm_lock_ppm{0};
+std::atomic<double> g_auto_ppm_lock_snr_db{-100.0};
+std::atomic<double> g_auto_ppm_lock_df_hz{0.0};
+std::atomic<double> g_auto_ppm_snr_db{-100.0};
+std::atomic<double> g_auto_ppm_df_hz{0.0};
+std::atomic<double> g_auto_ppm_est_ppm{0.0};
+std::atomic<int> g_auto_ppm_last_dir{0};
+std::atomic<int> g_auto_ppm_cooldown{0};
+
+static int
+cqpsk_loop_lock_heuristic(float total_freq_rad, int out_rate_hz) {
+    static int prev_valid = 0;
+    static float prev_total_freq_rad = 0.0f;
+    static int freq_stable_blocks = 0;
+
+    if (!demod.cqpsk_enable || out_rate_hz <= 0) {
+        prev_valid = 0;
+        freq_stable_blocks = 0;
+        return 0;
+    }
+
+    const ted_state_t* ted = &demod.ted_state;
+    if (!demod.fll_band_edge_state.initialized || !demod.costas_state.initialized || ted->lock_count < 24) {
+        prev_total_freq_rad = total_freq_rad;
+        prev_valid = 1;
+        freq_stable_blocks = 0;
+        return 0;
+    }
+
+    double delta_hz = 0.0;
+    if (prev_valid) {
+        delta_hz = fabs((double)(total_freq_rad - prev_total_freq_rad)) * (double)out_rate_hz / (2.0 * M_PI);
+    }
+    prev_total_freq_rad = total_freq_rad;
+    prev_valid = 1;
+
+    if (delta_hz < 75.0) {
+        if (freq_stable_blocks < 1000) {
+            freq_stable_blocks++;
+        }
+    } else {
+        freq_stable_blocks = 0;
+    }
+
+    float ted_lock = ted->lock_accum / (float)ted->lock_count;
+    float costas_err = (float)demod.costas_err_avg_q14 / 16384.0f;
+    float fll_abs = fabsf(demod.fll_band_edge_state.freq);
+    float fll_limit = fabsf(demod.fll_band_edge_state.max_freq);
+    if (!std::isfinite(fll_limit) || fll_limit <= 0.0f) {
+        fll_limit = 1.0f;
+    }
+    float fll_lock_limit = fll_limit * 0.95f;
+
+    return (freq_stable_blocks >= 2 && ted_lock > 0.25f && costas_err < 0.65f && fll_abs < fll_lock_limit) ? 1 : 0;
+}
+
+static inline PFFFT_Setup*
+pffft_get_cached_setup(int N) {
+    static PFFFT_Setup* setup = nullptr;
+    static int setup_N = 0;
+    if (!setup || setup_N != N) {
+        if (setup) {
+            pffft_destroy_setup(setup);
+            setup = nullptr;
+            setup_N = 0;
+        }
+        setup = pffft_new_setup(N, PFFFT_COMPLEX);
+        setup_N = N;
+    }
+    return setup;
+}
+
+static inline const float*
+rtl_metrics_hann_window(int N) {
+    alignas(16) static float window[kSpecMaxN];
+    static int window_N = 0;
+    if (window_N != N) {
+        if (N <= 1) {
+            window[0] = 1.0f;
+        } else {
+            const float scale = 2.0f * static_cast<float>(M_PI) / static_cast<float>(N - 1);
+            for (int n = 0; n < N; n++) {
+                window[n] = 0.5f * (1.0f - cosf(scale * static_cast<float>(n)));
+            }
+        }
+        window_N = N;
+    }
+    return window;
+}
+
+namespace {
+
+struct rtl_metrics_fft_frame {
+    int N = 0;
+    int take = 0;
+    int start = 0;
+    float meanI = 0.0f;
+    float meanQ = 0.0f;
+};
+
+struct rtl_metrics_peak_metrics {
+    int i_max = 0;
+    float p_max = -100.0f;
+    float spec_snr_db = -100.0f;
+    double df_spec_hz = 0.0;
+};
+
+struct rtl_metrics_nco_metrics {
+    float total_freq_rad = 0.0f;
+    double cfo_hz = 0.0;
+};
+
+} // namespace
+
+static int
+rtl_metrics_fft_size(void) {
+    int N = g_spec_N.load(std::memory_order_relaxed);
+    if (N < 64) {
+        N = 64;
+    }
+    if (N > kSpecMaxN) {
+        N = kSpecMaxN;
+    }
+    return N;
+}
+
+static rtl_metrics_fft_frame
+rtl_metrics_prepare_fft_input(const float* iq_interleaved, int pairs, int N, float* z) {
+    rtl_metrics_fft_frame frame = {};
+    frame.N = N;
+    frame.take = (pairs >= N) ? N : pairs;
+    frame.start = pairs - frame.take;
+
+    double sumI = 0.0;
+    double sumQ = 0.0;
+    for (int n = 0; n < frame.take; n++) {
+        int idx = frame.start + n;
+        sumI += static_cast<double>(iq_interleaved[(size_t)(idx << 1)]);
+        sumQ += static_cast<double>(iq_interleaved[(size_t)(idx << 1) + 1]);
+    }
+    if (frame.take > 0) {
+        frame.meanI = static_cast<float>(sumI / static_cast<double>(frame.take));
+        frame.meanQ = static_cast<float>(sumQ / static_cast<double>(frame.take));
+    }
+
+    if (frame.take < N) {
+        for (int n = 0; n < (N << 1); n++) {
+            z[n] = 0.0f;
+        }
+    }
+
+    const float* hann = rtl_metrics_hann_window(N);
+    for (int n = 0; n < frame.take; n++) {
+        int idx = frame.start + n;
+        float I = iq_interleaved[(size_t)(idx << 1)];
+        float Q = iq_interleaved[(size_t)(idx << 1) + 1];
+        float w = hann[n];
+        z[(n << 1)] = w * (I - frame.meanI);
+        z[(n << 1) + 1] = w * (Q - frame.meanQ);
+    }
+    return frame;
+}
+
+static double
+rtl_metrics_phase_cfo_hz(const float* iq_interleaved, const rtl_metrics_fft_frame& frame, int out_rate_hz) {
+    if (frame.take < 2 || out_rate_hz <= 0) {
+        return 0.0;
+    }
+
+    double acc_re = 0.0;
+    double acc_im = 0.0;
+    float prevI = iq_interleaved[(frame.start << 1)] - frame.meanI;
+    float prevQ = iq_interleaved[(frame.start << 1) + 1] - frame.meanQ;
+    for (int n = 1; n < frame.take; n++) {
+        int idx = frame.start + n;
+        float I = iq_interleaved[(size_t)(idx << 1)] - frame.meanI;
+        float Q = iq_interleaved[(size_t)(idx << 1) + 1] - frame.meanQ;
+        acc_re +=
+            static_cast<double>(prevI) * static_cast<double>(I) + static_cast<double>(prevQ) * static_cast<double>(Q);
+        acc_im +=
+            static_cast<double>(prevI) * static_cast<double>(Q) - static_cast<double>(prevQ) * static_cast<double>(I);
+        prevI = I;
+        prevQ = Q;
+    }
+
+    if (fabs(acc_re) <= 1e-9 && fabs(acc_im) <= 1e-9) {
+        return 0.0;
+    }
+    return atan2(acc_im, acc_re) * static_cast<double>(out_rate_hz) / (2.0 * M_PI);
+}
+
+static void
+rtl_metrics_smooth_spectrum_bins(int N, int out_rate_hz, const float* z) {
+    const float eps = 1e-12f;
+    const bool first = (g_spec_ready.load(std::memory_order_relaxed) == 0);
+    for (int k = 0; k < N; k++) {
+        int kk = k + (N >> 1);
+        if (kk >= N) {
+            kk -= N;
+        }
+        float re = z[(kk << 1)];
+        float im = z[(kk << 1) + 1];
+        float mag2 = re * re + im * im;
+        float db = 10.0f * log10f(mag2 + eps);
+        g_spec_db[k] = first ? db : (0.8f * g_spec_db[k] + 0.2f * db);
+    }
+    g_spec_rate_hz.store(out_rate_hz, std::memory_order_relaxed);
+    g_spec_ready.store(1, std::memory_order_release);
+}
+
+static void
+rtl_metrics_peak_search_bounds(int N, int* k_center_i, int* i_lo, int* i_hi) {
+    *k_center_i = N >> 1;
+    int W = N >> 2;
+    if (W < 8) {
+        W = 8;
+    }
+    *i_lo = *k_center_i - W;
+    *i_hi = *k_center_i + W;
+    if (*i_lo < 2) {
+        *i_lo = 2;
+    }
+    if (*i_hi > N - 3) {
+        *i_hi = N - 3;
+    }
+}
+
+static void
+rtl_metrics_peak_find_bin(int i_lo, int i_hi, int* i_max, float* p_max) {
+    *i_max = i_lo;
+    *p_max = g_spec_db[i_lo];
+    for (int k = i_lo + 1; k <= i_hi; k++) {
+        if (g_spec_db[k] > *p_max) {
+            *p_max = g_spec_db[k];
+            *i_max = k;
+        }
+    }
+}
+
+static float
+rtl_metrics_peak_noise_snr(int i_lo, int i_hi, int i_max, float p_max) {
+    alignas(16) float noise_bins[kSpecMaxN];
+    int noise_count = 0;
+    for (int k = i_lo; k <= i_hi; k++) {
+        if (k < i_max - 2 || k > i_max + 2) {
+            noise_bins[noise_count++] = g_spec_db[k];
+        }
+    }
+    if (noise_count < 16) {
+        return -100.0f;
+    }
+    int mid = noise_count / 2;
+    std::nth_element(noise_bins, noise_bins + mid, noise_bins + noise_count);
+    return p_max - noise_bins[mid];
+}
+
+static float
+rtl_metrics_peak_center_tone_filter(int N, int k_center_i, int i_max, float p_max, float spec_snr_db) {
+    if (N < 3 || i_max <= 0 || i_max + 1 >= N || i_max != k_center_i) {
+        return spec_snr_db;
+    }
+    float side_max = (g_spec_db[i_max - 1] > g_spec_db[i_max + 1]) ? g_spec_db[i_max - 1] : g_spec_db[i_max + 1];
+    if ((p_max - side_max) > 12.0f) {
+        return -100.0f;
+    }
+    return spec_snr_db;
+}
+
+static double
+rtl_metrics_peak_df_spec_hz(int N, int i_max, int out_rate_hz) {
+    if (!(N >= 3 && i_max > 0 && i_max + 1 < N && out_rate_hz > 0)) {
+        return 0.0;
+    }
+
+    double p1 = g_spec_db[i_max - 1];
+    double p2 = g_spec_db[i_max];
+    double p3 = g_spec_db[i_max + 1];
+    double denom = (p1 - 2.0 * p2 + p3);
+    double delta = (fabs(denom) > 1e-9) ? (0.5 * (p1 - p3) / denom) : 0.0;
+    if (delta < -0.5) {
+        delta = -0.5;
+    } else if (delta > 0.5) {
+        delta = 0.5;
+    }
+
+    double center = static_cast<double>(N) / 2.0;
+    double k_off = (static_cast<double>(i_max) + delta) - center;
+    return k_off * static_cast<double>(out_rate_hz) / static_cast<double>(N);
+}
+
+static rtl_metrics_peak_metrics
+rtl_metrics_compute_peak_metrics(int N, int out_rate_hz) {
+    rtl_metrics_peak_metrics peak = {};
+    int k_center_i = 0;
+    int i_lo = 0;
+    int i_hi = 0;
+    rtl_metrics_peak_search_bounds(N, &k_center_i, &i_lo, &i_hi);
+    rtl_metrics_peak_find_bin(i_lo, i_hi, &peak.i_max, &peak.p_max);
+    peak.spec_snr_db = rtl_metrics_peak_noise_snr(i_lo, i_hi, peak.i_max, peak.p_max);
+    peak.spec_snr_db = rtl_metrics_peak_center_tone_filter(N, k_center_i, peak.i_max, peak.p_max, peak.spec_snr_db);
+    peak.df_spec_hz = rtl_metrics_peak_df_spec_hz(N, peak.i_max, out_rate_hz);
+    return peak;
+}
+
+static rtl_metrics_nco_metrics
+rtl_metrics_compute_nco_metrics(int out_rate_hz) {
+    rtl_metrics_nco_metrics nco = {};
+    if (out_rate_hz <= 0) {
+        return nco;
+    }
+
+    if (!demod.cqpsk_enable) {
+        return nco;
+    }
+    float band_edge_freq = demod.fll_band_edge_state.freq;
+    float costas_freq = demod.costas_state.freq;
+    int sps = demod.ted_sps > 0 ? demod.ted_sps : 5;
+    float costas_freq_sample_rate = costas_freq / static_cast<float>(sps);
+    nco.total_freq_rad = band_edge_freq + costas_freq_sample_rate;
+    nco.cfo_hz = static_cast<double>(nco.total_freq_rad) * static_cast<double>(out_rate_hz) / (2.0 * M_PI);
+    return nco;
+}
+
+static void
+rtl_metrics_store_nco_metrics(const rtl_metrics_nco_metrics& nco, int out_rate_hz) {
+    g_cfo_nco_hz.store(nco.cfo_hz, std::memory_order_relaxed);
+    int nco_freq_q15 = static_cast<int>(lrint(nco.total_freq_rad * (32768.0 / (2.0 * M_PI))));
+    g_nco_q15.store(nco_freq_q15, std::memory_order_relaxed);
+    g_demod_rate_hz.store(out_rate_hz, std::memory_order_relaxed);
+    g_costas_err_avg_q14.store(demod.costas_err_avg_q14, std::memory_order_relaxed);
+    g_costas_err_raw_avg_q14.store(demod.costas_err_raw_avg_q14, std::memory_order_relaxed);
+    g_costas_conf_avg_q14.store(demod.costas_conf_avg_q14, std::memory_order_relaxed);
+    g_costas_zero_conf_pct.store(demod.costas_zero_conf_pct, std::memory_order_relaxed);
+}
+
+/**
+ * @brief Update spectrum, CFO, and SNR exports from an interleaved I/Q block.
+ *
+ * Copies the most recent samples into a windowed buffer, performs an FFT,
+ * smooths the power spectrum, and updates residual CFO and Costas/band-edge exports.
+ *
+ * @param iq_interleaved Interleaved int16_t I/Q samples.
+ * @param len_interleaved Number of int16_t elements in `iq_interleaved`.
+ * @param out_rate_hz Output sample rate used for CFO scaling.
+ */
+void
+rtl_metrics_update_spectrum_from_iq(const float* iq_interleaved, int len_interleaved, int out_rate_hz) {
+    if (!iq_interleaved || len_interleaved < 2) {
+        return;
+    }
+    const int pairs = len_interleaved >> 1;
+    int N = rtl_metrics_fft_size();
+    alignas(16) static float z[2 * kSpecMaxN];
+    rtl_metrics_fft_frame frame = rtl_metrics_prepare_fft_input(iq_interleaved, pairs, N, z);
+    double phase_cfo_hz = rtl_metrics_phase_cfo_hz(iq_interleaved, frame, out_rate_hz);
+    g_resid_cfo_phase_hz.store(phase_cfo_hz, std::memory_order_relaxed);
+
+    PFFFT_Setup* setup = pffft_get_cached_setup(N);
+    if (setup) {
+        pffft_transform_ordered(setup, z, z, nullptr, PFFFT_FORWARD);
+        rtl_metrics_smooth_spectrum_bins(N, out_rate_hz, z);
+    }
+    rtl_metrics_peak_metrics peak = rtl_metrics_compute_peak_metrics(N, out_rate_hz);
+    g_spec_peak_db.store(peak.p_max, std::memory_order_relaxed);
+    g_spec_snr_db.store(peak.spec_snr_db, std::memory_order_relaxed);
+    g_resid_cfo_spec_hz.store(peak.df_spec_hz, std::memory_order_relaxed);
+
+    /* NCO CFO from CQPSK band-edge/Costas recovery (native float freq in rad/sample, scaled by Fs/(2π))
+     *
+     * For CQPSK (OP25-compatible flow), the total CFO is the sum of:
+     *   1. FLL band-edge frequency (coarse, at sample rate) - fll_band_edge_state.freq
+     *   2. Costas frequency (fine, at symbol rate) - costas_state.freq
+     *
+     * The Costas operates at symbol rate (Fs/sps), so its frequency must be scaled
+     * by (1/sps) to convert to sample-rate equivalent before adding to FLL freq.
+     */
+    rtl_metrics_nco_metrics nco = rtl_metrics_compute_nco_metrics(out_rate_hz);
+    rtl_metrics_store_nco_metrics(nco, out_rate_hz);
+
+    /* Store FLL band-edge freq for UI access. */
+    g_fll_band_edge_freq_rad.store(static_cast<double>(demod.fll_band_edge_state.freq), std::memory_order_relaxed);
+
+    /* CQPSK lock is loop-health based, not an SNR proxy: require the carrier NCO
+     * to be stable, the Gardner TED eye metric to be positive, and Costas phase
+     * error to be bounded. */
+    int locked = cqpsk_loop_lock_heuristic(nco.total_freq_rad, out_rate_hz);
+    g_carrier_lock.store(locked, std::memory_order_relaxed);
+}
+
+/* Spectrum and carrier diagnostics query helpers. */
+/**
+ * @brief Copy the smoothed spectrum into the caller's buffer.
+ *
+ * Returns the number of bins copied (clamped to both the configured FFT size
+ * and `max_bins`). Optionally returns the current sample rate used for the FFT.
+ *
+ * @param out_db   [out] Destination buffer for power values in dB.
+ * @param max_bins Maximum bins to copy.
+ * @param out_rate [out] Optional sample rate in Hz.
+ * @return Number of bins copied (0 if not ready or on invalid input).
+ */
+extern "C" int
+dsd_rtl_stream_spectrum_get(float* out_db, int max_bins, int* out_rate) {
+    if (!out_db || max_bins <= 0) {
+        return 0;
+    }
+    if (g_spec_ready.load(std::memory_order_acquire) == 0) {
+        return 0;
+    }
+    int N = g_spec_N.load(std::memory_order_relaxed);
+    if (N < 64) {
+        N = 64;
+    }
+    if (N > kSpecMaxN) {
+        N = kSpecMaxN;
+    }
+    int n = (max_bins < N) ? max_bins : N;
+    for (int i = 0; i < n; i++) {
+        out_db[i] = g_spec_db[i];
+    }
+    if (out_rate) {
+        *out_rate = g_spec_rate_hz.load(std::memory_order_relaxed);
+    }
+    return n;
+}
+
+/**
+ * @brief Configure the FFT size used for spectrum exports.
+ *
+ * The size is clamped to [64, kSpecMaxN] and rounded up to the next power of
+ * two for the pffft complex transform.
+ *
+ * @param n Requested FFT length (bins).
+ * @return Actual FFT length selected.
+ */
+extern "C" int
+dsd_rtl_stream_spectrum_set_size(int n) {
+    if (n < 64) {
+        n = 64;
+    }
+    if (n > kSpecMaxN) {
+        n = kSpecMaxN;
+    }
+    int p = 64;
+    while (p < n) {
+        p <<= 1;
+    }
+    if (p > kSpecMaxN) {
+        p = kSpecMaxN;
+    }
+    g_spec_N.store(p, std::memory_order_relaxed);
+    return p;
+}
+
+/**
+ * @brief Get the current FFT size used for spectrum exports.
+ * @return FFT length in bins.
+ */
+extern "C" int
+dsd_rtl_stream_spectrum_get_size(void) {
+    int N = g_spec_N.load(std::memory_order_relaxed);
+    if (N < 64) {
+        N = 64;
+    }
+    if (N > kSpecMaxN) {
+        N = kSpecMaxN;
+    }
+    return N;
+}
+
+/** @brief Return the current NCO CFO estimate in Hz derived from Costas/FLL. */
+extern "C" double
+dsd_rtl_stream_get_cfo_hz(void) {
+    return g_cfo_nco_hz.load(std::memory_order_relaxed);
+}
+
+/** @brief Return the residual CFO estimate in Hz derived from the spectrum peak. */
+extern "C" double
+dsd_rtl_stream_get_residual_cfo_hz(void) {
+    return g_resid_cfo_spec_hz.load(std::memory_order_relaxed);
+}
+
+/** @brief Return 1 when the CQPSK carrier lock heuristic is satisfied. */
+extern "C" int
+dsd_rtl_stream_get_carrier_lock(void) {
+    return g_carrier_lock.load(std::memory_order_relaxed) ? 1 : 0;
+}
+
+/** @brief Get the current FLL/Costas NCO frequency in Q15 cycles/sample. */
+extern "C" int
+dsd_rtl_stream_get_nco_q15(void) {
+    return g_nco_q15.load(std::memory_order_relaxed);
+}
+
+/** @brief Get the demodulator sample rate (Hz) used for CFO scaling. */
+extern "C" int
+dsd_rtl_stream_get_demod_rate_hz(void) {
+    return g_demod_rate_hz.load(std::memory_order_relaxed);
+}
+
+/** @brief Get the smoothed Costas error term (Q14). */
+extern "C" int
+dsd_rtl_stream_get_costas_err_q14(void) {
+    return g_costas_err_avg_q14.load(std::memory_order_relaxed);
+}
+
+/** @brief Get Costas discriminator health metrics for the latest DSP block. */
+extern "C" int
+dsd_rtl_stream_get_costas_metrics(rtl_stream_costas_metrics* out) {
+    if (!out) {
+        return -1;
+    }
+    out->err_smooth_avg_q14 = g_costas_err_avg_q14.load(std::memory_order_relaxed);
+    out->err_raw_avg_q14 = g_costas_err_raw_avg_q14.load(std::memory_order_relaxed);
+    out->confidence_avg_q14 = g_costas_conf_avg_q14.load(std::memory_order_relaxed);
+    out->zero_conf_pct = g_costas_zero_conf_pct.load(std::memory_order_relaxed);
+    return 0;
+}
+
+/** @brief Return the FLL band-edge frequency estimate in Hz. */
+extern "C" double
+dsd_rtl_stream_get_fll_band_edge_freq_hz(void) {
+    int Fs = g_demod_rate_hz.load(std::memory_order_relaxed);
+    if (Fs <= 0) {
+        return 0.0;
+    }
+    /* FLL band-edge freq is in rad/sample; convert to Hz: f_hz = freq * Fs / (2π).
+     * Read from atomic to avoid data race with demod thread. */
+    double freq_rad = g_fll_band_edge_freq_rad.load(std::memory_order_relaxed);
+    return freq_rad * static_cast<double>(Fs) / (2.0 * M_PI);
+}
+
+/**
+ * @brief Reset Costas loop state for fresh carrier acquisition on retune.
+ *
+ * Clears the Costas phase and error estimates, but PRESERVES the frequency
+ * estimate. The carrier frequency offset is primarily a property of the RTL-SDR
+ * local oscillator, not the channel. Preserving freq allows immediate tracking
+ * on channel changes rather than slewing from 0 Hz.
+ *
+ * Also resets the differential phasor history to (1,0) so the first sample's
+ * diff output equals raw input.
+ */
+extern "C" void
+dsd_rtl_stream_reset_costas(void) {
+    /* Reset phase and error, but preserve frequency estimate */
+    demod.costas_state.phase = 0.0f;
+    demod.costas_state.error = 0.0f;
+    demod.costas_state.error_smooth = 0.0f;
+    demod.costas_err_avg_q14 = 0;
+    demod.costas_err_raw_avg_q14 = 0;
+    demod.costas_conf_avg_q14 = 0;
+    demod.costas_zero_conf_pct = 0;
+    g_costas_err_avg_q14.store(0, std::memory_order_relaxed);
+    g_costas_err_raw_avg_q14.store(0, std::memory_order_relaxed);
+    g_costas_conf_avg_q14.store(0, std::memory_order_relaxed);
+    g_costas_zero_conf_pct.store(0, std::memory_order_relaxed);
+    /* Note: deliberately NOT zeroing costas_state.freq - preserve it! */
+
+    /* Reset differential decode history to (1,0) not (0,0).
+     * When prev is (0,0), the first diff decode produces zero output,
+     * which corrupts the Costas phase error and causes the loop to hunt.
+     * Using (1,0) means the first sample's diff output equals raw input. */
+    demod.cqpsk_diff_prev_r = 1.0f;
+    demod.cqpsk_diff_prev_j = 0.0f;
+}
+
+/* Smoothed SNR exports (for UI and protocol code). */
+/** @brief Get the smoothed C4FM SNR estimate in dB (negative when unavailable). */
+extern "C" double
+rtl_stream_get_snr_c4fm(void) {
+    return g_snr_c4fm_db.load(std::memory_order_relaxed);
+}
+
+/** @brief Get the smoothed CQPSK SNR estimate in dB (negative when unavailable). */
+extern "C" double
+rtl_stream_get_snr_cqpsk(void) {
+    return g_snr_qpsk_db.load(std::memory_order_relaxed);
+}
+
+/** @brief Get the smoothed GFSK SNR estimate in dB (negative when unavailable). */
+extern "C" double
+rtl_stream_get_snr_gfsk(void) {
+    return g_snr_gfsk_db.load(std::memory_order_relaxed);
+}
+
+/* Supervisory tuner autogain runtime control */
+/** @brief Return the supervisory tuner auto-gain flag (1=enabled). */
+extern "C" int
+dsd_rtl_stream_get_tuner_autogain(void) {
+    return g_tuner_autogain_on.load(std::memory_order_relaxed) ? 1 : 0;
+}
+
+/** @brief Enable or disable supervisory tuner auto-gain (atomic flag). */
+extern "C" void
+dsd_rtl_stream_set_tuner_autogain(int onoff) {
+    g_tuner_autogain_on.store(onoff ? 1 : 0, std::memory_order_relaxed);
+}
+
+/**
+ * @brief Snapshot auto-PPM supervision status.
+ *
+ * Fills out the optional output parameters with the latest SNR, frequency
+ * offset, estimate, direction, cooldown, and lock status.
+ *
+ * @param enabled  [out] Whether auto-PPM is currently enabled.
+ * @param snr_db   [out] Current SNR estimate in dB.
+ * @param df_hz    [out] Current frequency offset estimate in Hz.
+ * @param est_ppm  [out] Current PPM estimate applied.
+ * @param last_dir [out] Most recent adjustment direction (-1/0/1).
+ * @param cooldown [out] Remaining cooldown ticks before next adjustment.
+ * @param locked   [out] Whether a stable PPM lock is latched.
+ * @return 0 always (snapshot only).
+ */
+int
+dsd_rtl_stream_auto_ppm_get_status(int* enabled, double* snr_db, double* df_hz, double* est_ppm, int* last_dir,
+                                   int* cooldown, int* locked) {
+    if (enabled) {
+        *enabled = g_auto_ppm_enabled.load(std::memory_order_relaxed);
+    }
+    if (snr_db) {
+        *snr_db = g_auto_ppm_snr_db.load(std::memory_order_relaxed);
+    }
+    if (df_hz) {
+        *df_hz = g_auto_ppm_df_hz.load(std::memory_order_relaxed);
+    }
+    if (est_ppm) {
+        *est_ppm = g_auto_ppm_est_ppm.load(std::memory_order_relaxed);
+    }
+    if (last_dir) {
+        *last_dir = g_auto_ppm_last_dir.load(std::memory_order_relaxed);
+    }
+    if (cooldown) {
+        *cooldown = g_auto_ppm_cooldown.load(std::memory_order_relaxed);
+    }
+    if (locked) {
+        *locked = g_auto_ppm_locked.load(std::memory_order_relaxed);
+    }
+    return 0;
+}
+
+/** @brief Return 1 if auto-PPM training is active. */
+int
+dsd_rtl_stream_auto_ppm_training_active(void) {
+    return g_auto_ppm_training.load(std::memory_order_relaxed) ? 1 : 0;
+}
+
+/**
+ * @brief Retrieve the last locked auto-PPM correction and supporting metrics.
+ *
+ * @param ppm    [out] Locked PPM value.
+ * @param snr_db [out] SNR at lock time in dB.
+ * @param df_hz  [out] Residual frequency offset at lock time in Hz.
+ * @return 0 always (snapshot only).
+ */
+int
+dsd_rtl_stream_auto_ppm_get_lock(int* ppm, double* snr_db, double* df_hz) {
+    if (ppm) {
+        *ppm = g_auto_ppm_lock_ppm.load(std::memory_order_relaxed);
+    }
+    if (snr_db) {
+        *snr_db = g_auto_ppm_lock_snr_db.load(std::memory_order_relaxed);
+    }
+    if (df_hz) {
+        *df_hz = g_auto_ppm_lock_df_hz.load(std::memory_order_relaxed);
+    }
+    return 0;
+}
+
+/**
+ * @brief Force-enable or disable auto-PPM (user override).
+ * @param onoff Non-zero to enable; zero to disable.
+ */
+void
+dsd_rtl_stream_set_auto_ppm(int onoff) {
+    g_auto_ppm_user_en.store(onoff ? 1 : 0, std::memory_order_relaxed);
+}
+
+/**
+ * @brief Get the effective auto-PPM enable flag after user overrides.
+ * @return 1 when enabled, 0 when disabled.
+ */
+int
+dsd_rtl_stream_get_auto_ppm(void) {
+    int u = g_auto_ppm_user_en.load(std::memory_order_relaxed);
+    if (u == 0) {
+        return 0;
+    }
+    if (u == 1) {
+        return 1;
+    }
+    return g_auto_ppm_enabled.load(std::memory_order_relaxed) ? 1 : 0;
+}

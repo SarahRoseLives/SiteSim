@@ -1,0 +1,164 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ *   Copyright (C) 2009-2016,2018 by Jonathan Naylor G4KLX
+ *
+ *   Copyright (C) 2018 by Edouard Griffiths F4EXB:
+ *   - Cosmetic changes to integrate with DSDcc
+ *
+ *   Copyright (C) 2018 by Louis HERVE F4HUZ:
+ *   - Transform C++ lib into C lib to integrate with DSD
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ */
+
+/* Include ------------------------------------------------------------------*/
+
+#include <dsd-neo/protocol/nxdn/nxdn_convolution.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include "dsd-neo/core/safe_api.h"
+
+static const uint8_t CNXDNConvolution_BIT_MASK_TABLE[8] = {0x80U, 0x40U, 0x20U, 0x10U, 0x08U, 0x04U, 0x02U, 0x01U};
+
+#define WRITE_BIT1(p, i, b)                                                                                            \
+    ((p)[(i) >> 3] = (b) ? (((p)[(i) >> 3]) | CNXDNConvolution_BIT_MASK_TABLE[(i) & 7])                                \
+                         : (((p)[(i) >> 3]) & ~CNXDNConvolution_BIT_MASK_TABLE[(i) & 7]))
+#define READ_BIT1(p, i) (((p)[(i) >> 3]) & CNXDNConvolution_BIT_MASK_TABLE[(i) & 7])
+
+static const uint8_t CNXDNConvolution_BRANCH_TABLE1[8] = {0U, 0U, 0U, 0U, 2U, 2U, 2U, 2U};
+static const uint8_t CNXDNConvolution_BRANCH_TABLE2[8] = {0U, 2U, 2U, 0U, 0U, 2U, 2U, 0U};
+
+static const unsigned int CNXDNConvolution_NUM_OF_STATES_D2 = 8U;
+static const uint32_t CNXDNConvolution_M = 4U;
+static const unsigned int CNXDNConvolution_K = 5U;
+
+//NOTE:
+static uint16_t m_metrics1[16];
+static uint16_t m_metrics2[16];
+static uint64_t m_decisions[8 * 300];
+static uint16_t* m_oldMetrics = NULL;
+static uint16_t* m_newMetrics = NULL;
+static uint64_t* m_dp = NULL;
+
+/* Functions ----------------------------------------------------------------*/
+
+void
+CNXDNConvolution_decode(uint8_t s0, uint8_t s1) {
+    *m_dp = 0U;
+
+    for (uint8_t i = 0U; i < CNXDNConvolution_NUM_OF_STATES_D2; i++) {
+        uint8_t j = i * 2U;
+        uint16_t metric = abs(CNXDNConvolution_BRANCH_TABLE1[i] - s0) + abs(CNXDNConvolution_BRANCH_TABLE2[i] - s1);
+
+        uint16_t m0 = m_oldMetrics[i] + metric;
+        uint16_t m1 = m_oldMetrics[i + CNXDNConvolution_NUM_OF_STATES_D2] + (CNXDNConvolution_M - metric);
+        uint8_t decision0 = (m0 >= m1) ? 1U : 0U;
+        m_newMetrics[j + 0U] = decision0 != 0U ? m1 : m0;
+
+        m0 = m_oldMetrics[i] + (CNXDNConvolution_M - metric);
+        m1 = m_oldMetrics[i + CNXDNConvolution_NUM_OF_STATES_D2] + metric;
+        uint8_t decision1 = (m0 >= m1) ? 1U : 0U;
+        m_newMetrics[j + 1U] = decision1 != 0U ? m1 : m0;
+
+        *m_dp |= ((uint64_t)(decision1) << (j + 1U)) | ((uint64_t)(decision0) << (j + 0U));
+    }
+
+    ++m_dp;
+
+    uint16_t* tmp = m_oldMetrics;
+    m_oldMetrics = m_newMetrics;
+    m_newMetrics = tmp;
+}
+
+void
+CNXDNConvolution_chainback(unsigned char* out, unsigned int nBits) {
+
+    uint32_t state = 0U;
+    while (nBits-- > 0) {
+        --m_dp;
+
+        uint32_t i = state >> (9 - CNXDNConvolution_K);
+        uint8_t bit = (uint8_t)(*m_dp >> i) & 1;
+        state = (bit << 7) | (state >> 1);
+
+        WRITE_BIT1(out, nBits, bit != 0U);
+    }
+}
+
+void
+CNXDNConvolution_start(void) {
+
+    m_oldMetrics = m_metrics1;
+    m_newMetrics = m_metrics2;
+    m_dp = m_decisions;
+}
+
+void
+CNXDNConvolution_init(void) {
+    DSD_MEMSET(m_metrics1, 0x0, sizeof(m_metrics1));
+    DSD_MEMSET(m_metrics2, 0x0, sizeof(m_metrics2));
+    DSD_MEMSET(m_decisions, 0x0, sizeof(m_decisions));
+}
+
+/*
+ * Soft-decision variant of CNXDNConvolution_decode.
+ * s0, s1: observed soft values (0..2 range, as in hard version)
+ * r0, r1: reliability weights (0..255, higher = more confident)
+ *
+ * The branch metric is scaled by reliability. Low reliability reduces
+ * the penalty for mismatches, allowing the Viterbi to favor paths
+ * through more reliable symbols.
+ */
+void
+CNXDNConvolution_decode_soft(uint8_t s0, uint8_t s1, uint8_t r0, uint8_t r1) {
+    /* Scale factor: hard metric uses 0,2 range, scale reliability from 0-255 to 0-128 */
+    const uint32_t scale = 128;
+    const uint32_t full_metric = (CNXDNConvolution_M * 256U) / scale; /* 8 with current constants */
+
+    *m_dp = 0U;
+
+    for (uint8_t i = 0U; i < CNXDNConvolution_NUM_OF_STATES_D2; i++) {
+        uint8_t j = i * 2U;
+
+        /* Weighted branch metric: difference * reliability / scale */
+        uint32_t diff0 = (uint32_t)abs((int)CNXDNConvolution_BRANCH_TABLE1[i] - (int)s0);
+        uint32_t diff1 = (uint32_t)abs((int)CNXDNConvolution_BRANCH_TABLE2[i] - (int)s1);
+        uint32_t metric = ((diff0 * r0) + (diff1 * r1)) / scale;
+
+        /* Keep branch metric within the decoder's expected [0..M] domain.
+         * This also prevents unsigned underflow in the complementary metric. */
+        if (metric > full_metric) {
+            metric = full_metric;
+        }
+
+        uint32_t m0 = m_oldMetrics[i] + metric;
+        uint32_t m1 = m_oldMetrics[i + CNXDNConvolution_NUM_OF_STATES_D2] + (full_metric - metric);
+        uint8_t decision0 = (m0 >= m1) ? 1U : 0U;
+        m_newMetrics[j + 0U] = (uint16_t)(decision0 != 0U ? m1 : m0);
+
+        m0 = m_oldMetrics[i] + (full_metric - metric);
+        m1 = m_oldMetrics[i + CNXDNConvolution_NUM_OF_STATES_D2] + metric;
+        uint8_t decision1 = (m0 >= m1) ? 1U : 0U;
+        m_newMetrics[j + 1U] = (uint16_t)(decision1 != 0U ? m1 : m0);
+
+        *m_dp |= ((uint64_t)(decision1) << (j + 1U)) | ((uint64_t)(decision0) << (j + 0U));
+    }
+
+    ++m_dp;
+
+    uint16_t* tmp = m_oldMetrics;
+    m_oldMetrics = m_newMetrics;
+    m_newMetrics = tmp;
+}

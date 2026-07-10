@@ -1,0 +1,251 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
+ */
+
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_PLATFORM_THREADING_H_
+#define DSD_NEO_INCLUDE_DSD_NEO_PLATFORM_THREADING_H_
+
+/**
+ * @file
+ * @brief Cross-platform threading abstraction for DSD-neo.
+ *
+ * Provides a unified API for threads, mutexes, and condition variables
+ * that works on both POSIX (pthreads) and Windows (Win32 threads).
+ */
+
+#include <dsd-neo/platform/platform.h>
+
+#if DSD_PLATFORM_WIN_NATIVE
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
+#include <errno.h> // IWYU pragma: keep
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*============================================================================
+ * Type Definitions
+ *============================================================================*/
+
+#if DSD_PLATFORM_WIN_NATIVE
+
+typedef HANDLE dsd_thread_t;
+typedef CRITICAL_SECTION dsd_mutex_t;
+typedef CONDITION_VARIABLE dsd_cond_t;
+
+/* Thread function signature */
+typedef unsigned int(__stdcall* dsd_thread_fn)(void* arg);
+#define DSD_THREAD_RETURN_TYPE unsigned int
+#define DSD_THREAD_RETURN      return 0
+
+#else /* POSIX */
+
+typedef pthread_t dsd_thread_t;
+typedef pthread_mutex_t dsd_mutex_t;
+typedef pthread_cond_t dsd_cond_t;
+
+/* Thread function signature */
+typedef void* (*dsd_thread_fn)(void* arg);
+#define DSD_THREAD_RETURN_TYPE void*
+#define DSD_THREAD_RETURN      return NULL
+
+#endif
+
+/*============================================================================
+ * Thread Functions
+ *============================================================================*/
+
+/**
+ * @brief Create and start a new thread.
+ *
+ * On POSIX C/C++ builds this expands to pthread_create at the call site so
+ * static analysis can preserve the concrete thread entry/argument pairing.
+ * The C++ form uses a lambda to keep the null checks without triggering
+ * -Waddress when passing named thread entry functions.
+ *
+ * @param thread    Pointer to thread handle (output).
+ * @param func      Thread entry function.
+ * @param arg       Argument passed to thread function.
+ * @return 0 on success, non-zero error code on failure.
+ */
+#if !DSD_PLATFORM_WIN_NATIVE && !defined(DSD_NEO_THREADING_NO_INLINE_CREATE) && defined(__cplusplus)
+#define dsd_thread_create(thread, func, arg)                                                                           \
+    ([&]() -> int {                                                                                                    \
+        dsd_thread_t* const dsd_thread_handle__ = (thread);                                                            \
+        dsd_thread_fn const dsd_thread_func__ = (func);                                                                \
+        void* const dsd_thread_arg__ = (arg);                                                                          \
+        return (!dsd_thread_handle__ || !dsd_thread_func__)                                                            \
+                   ? EINVAL                                                                                            \
+                   : pthread_create(dsd_thread_handle__, NULL, dsd_thread_func__, dsd_thread_arg__);                   \
+    }())
+#elif !DSD_PLATFORM_WIN_NATIVE && !defined(DSD_NEO_THREADING_NO_INLINE_CREATE)
+#define dsd_thread_create(thread, func, arg)                                                                           \
+    (((thread) == NULL || (func) == NULL) ? EINVAL : pthread_create((thread), NULL, (func), (arg)))
+#else
+int dsd_thread_create_impl(dsd_thread_t* thread, void* arg, dsd_thread_fn func);
+#define dsd_thread_create(thread, func, arg) dsd_thread_create_impl((thread), (arg), (func))
+#endif
+
+/**
+ * @brief Wait for a thread to terminate.
+ *
+ * @param thread    Thread handle.
+ * @return 0 on success, non-zero error code on failure.
+ */
+int dsd_thread_join(dsd_thread_t thread);
+
+/**
+ * @brief Get handle/ID of the calling thread.
+ *
+ * @return Thread handle of caller.
+ */
+dsd_thread_t dsd_thread_self(void);
+
+/*============================================================================
+ * Mutex Functions
+ *============================================================================*/
+
+/**
+ * @brief Initialize a mutex.
+ *
+ * @param mutex     Pointer to mutex (output).
+ * @return 0 on success, non-zero error code on failure.
+ */
+int dsd_mutex_init(dsd_mutex_t* mutex);
+
+/**
+ * @brief Destroy a mutex and release resources.
+ *
+ * @param mutex     Pointer to mutex.
+ * @return 0 on success, non-zero error code on failure.
+ */
+int dsd_mutex_destroy(dsd_mutex_t* mutex);
+
+/**
+ * @brief Lock a mutex (blocking).
+ *
+ * @param mutex     Pointer to mutex.
+ * @return 0 on success, non-zero error code on failure.
+ */
+int dsd_mutex_lock(dsd_mutex_t* mutex);
+
+/**
+ * @brief Unlock a mutex.
+ *
+ * @param mutex     Pointer to mutex.
+ * @return 0 on success, non-zero error code on failure.
+ */
+int dsd_mutex_unlock(dsd_mutex_t* mutex);
+
+/*============================================================================
+ * Condition Variable Functions
+ *============================================================================*/
+
+/**
+ * @brief Initialize a condition variable.
+ *
+ * @param cond      Pointer to condition variable (output).
+ * @return 0 on success, non-zero error code on failure.
+ */
+int dsd_cond_init(dsd_cond_t* cond);
+
+/**
+ * @brief Destroy a condition variable.
+ *
+ * @param cond      Pointer to condition variable.
+ * @return 0 on success, non-zero error code on failure.
+ */
+int dsd_cond_destroy(dsd_cond_t* cond);
+
+/**
+ * @brief Wait on a condition variable.
+ *
+ * Atomically unlocks the mutex and waits for the condition to be signaled.
+ * Mutex is re-locked before returning.
+ *
+ * @param cond      Pointer to condition variable.
+ * @param mutex     Pointer to associated mutex (must be locked).
+ * @return 0 on success, non-zero error code on failure.
+ */
+int dsd_cond_wait(dsd_cond_t* cond, dsd_mutex_t* mutex);
+
+/**
+ * @brief Wait on a condition variable with timeout.
+ *
+ * @param cond          Pointer to condition variable.
+ * @param mutex         Pointer to associated mutex (must be locked).
+ * @param timeout_ms    Timeout in milliseconds.
+ * @return 0 on success, ETIMEDOUT on timeout, other non-zero on error.
+ */
+int dsd_cond_timedwait(dsd_cond_t* cond, dsd_mutex_t* mutex, unsigned int timeout_ms);
+
+/**
+ * @brief Initialize a condition variable for monotonic-clock waits.
+ *
+ * On POSIX platforms with clock-selectable condition variables this binds
+ * timed waits to CLOCK_MONOTONIC. Platforms without that support may use a
+ * relative-time fallback that is still driven by monotonic deadlines.
+ *
+ * @param cond Pointer to condition variable (output).
+ * @return 0 on success, non-zero error code on failure.
+ */
+int dsd_cond_init_monotonic(dsd_cond_t* cond);
+
+/**
+ * @brief Timed wait using an absolute monotonic deadline.
+ *
+ * @param cond Pointer to condition variable.
+ * @param mutex Pointer to associated mutex (must be locked).
+ * @param deadline_ns Absolute monotonic deadline from dsd_time_monotonic_ns().
+ * @return 0 on signal, ETIMEDOUT on deadline expiry, other non-zero on error.
+ */
+int dsd_cond_timedwait_monotonic(dsd_cond_t* cond, dsd_mutex_t* mutex, uint64_t deadline_ns);
+
+/**
+ * @brief Signal one thread waiting on a condition variable.
+ *
+ * @param cond      Pointer to condition variable.
+ * @return 0 on success, non-zero error code on failure.
+ */
+int dsd_cond_signal(dsd_cond_t* cond);
+
+/**
+ * @brief Signal all threads waiting on a condition variable.
+ *
+ * @param cond      Pointer to condition variable.
+ * @return 0 on success, non-zero error code on failure.
+ */
+int dsd_cond_broadcast(dsd_cond_t* cond);
+
+/*============================================================================
+ * Thread Priority / Scheduling (Optional)
+ *============================================================================*/
+
+/**
+ * @brief Attempt to set realtime priority for current thread.
+ *
+ * @param priority  Priority level (platform-specific interpretation).
+ * @return 0 on success, non-zero on failure (may require elevated privileges).
+ */
+int dsd_thread_set_realtime_priority(int priority);
+
+/**
+ * @brief Set CPU affinity for current thread.
+ *
+ * @param cpu_index     CPU core index to pin to.
+ * @return 0 on success, non-zero on failure or if unsupported.
+ */
+int dsd_thread_set_affinity(int cpu_index);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_PLATFORM_THREADING_H_ */

@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
+ */
+
+/**
+ * @file
+ * @brief Time/date formatting helpers.
+ *
+ * Provides small helpers used for console/UI timestamps and log filenames.
+ */
+
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_CORE_TIME_FORMAT_H_H
+#define DSD_NEO_INCLUDE_DSD_NEO_CORE_TIME_FORMAT_H_H
+
+#include <time.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void getTime_buf(char out[7]);  /* HHmmss */
+void getTimeC_buf(char out[9]); /* HH:MM:SS */
+void getTimeN_buf(time_t t, char out[9]);
+void getTimeF_buf(time_t t, char out[7]);
+
+void getDate_buf(char out[9]);   /* YYYYMMDD */
+void getDateH_buf(char out[11]); /* YYYY-MM-DD */
+void getDateS_buf(char out[11]); /* YYYY/MM/DD */
+void getDateN_buf(time_t t, char out[11]);
+void getDateF_buf(time_t t, char out[9]);
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_CORE_TIME_FORMAT_H_H */

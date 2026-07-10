@@ -1,0 +1,1371 @@
+name: linux-ci
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+    tags:
+      - "v*.*.*"
+
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend-matrix:
+    name: backend-matrix (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: both
+            cmake_flags: -DDSD_ENABLE_RTLSDR=ON -DDSD_REQUIRE_RTLSDR=ON -DDSD_ENABLE_SOAPYSDR=ON -DDSD_REQUIRE_SOAPYSDR=ON
+            rtl_enabled: ON
+            rtl_available: ON
+            soapy_enabled: ON
+            soapy_available: ON
+            radio_available: ON
+          - variant: soapy_only
+            cmake_flags: -DDSD_ENABLE_RTLSDR=OFF -DDSD_ENABLE_SOAPYSDR=ON -DDSD_REQUIRE_SOAPYSDR=ON
+            rtl_enabled: OFF
+            rtl_available: OFF
+            soapy_enabled: ON
+            soapy_available: ON
+            radio_available: ON
+          - variant: rtl_only
+            cmake_flags: -DDSD_ENABLE_RTLSDR=ON -DDSD_REQUIRE_RTLSDR=ON -DDSD_ENABLE_SOAPYSDR=OFF
+            rtl_enabled: ON
+            rtl_available: ON
+            soapy_enabled: OFF
+            soapy_available: OFF
+            radio_available: ON
+          - variant: neither
+            cmake_flags: -DDSD_ENABLE_RTLSDR=OFF -DDSD_ENABLE_SOAPYSDR=OFF
+            rtl_enabled: OFF
+            rtl_available: OFF
+            soapy_enabled: OFF
+            soapy_available: OFF
+            radio_available: OFF
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config git \
+            libsndfile1-dev libpulse-dev libncurses-dev \
+            libusb-1.0-0-dev libfftw3-dev libblas-dev liblapack-dev gfortran \
+            libcodec2-dev librtlsdr-dev libsoapysdr-dev libcurl4-openssl-dev
+
+      - name: Build and install mbelib-neo
+        run: |
+          set -euxo pipefail
+          source tools/ci-dependency-pins.env
+          tools/fetch-pinned-git.sh https://github.com/arancormonk/mbelib-neo "$MBELIB_NEO_SHA" /tmp/mbelib-neo
+          cmake -S /tmp/mbelib-neo -B /tmp/mbelib-neo/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_INSTALL_PREFIX="$HOME/.local"
+          cmake --build /tmp/mbelib-neo/build -j
+          cmake --install /tmp/mbelib-neo/build
+
+      - name: Prepare local dependency environment
+        run: |
+          {
+            echo "PKG_CONFIG_PATH=$HOME/.local/lib/pkgconfig:$HOME/.local/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+            echo "CMAKE_PREFIX_PATH=$HOME/.local:${CMAKE_PREFIX_PATH:-}"
+            echo "LD_LIBRARY_PATH=$HOME/.local/lib:$HOME/.local/lib64:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure (${{ matrix.variant }})
+        run: |
+          set -euxo pipefail
+          log="$RUNNER_TEMP/configure-${{ matrix.variant }}.log"
+          cmake --preset dev-debug ${{ matrix.cmake_flags }} 2>&1 | tee "$log"
+          grep -F "RTL-SDR backend enabled: ${{ matrix.rtl_enabled }} (available: ${{ matrix.rtl_available }})" "$log"
+          grep -F "SoapySDR backend enabled: ${{ matrix.soapy_enabled }} (available: ${{ matrix.soapy_available }})" "$log"
+          grep -F "Radio pipeline available: ${{ matrix.radio_available }}" "$log"
+
+      - name: Build (${{ matrix.variant }})
+        run: |
+          cmake --build --preset dev-debug -j
+
+  backend-pr:
+    name: backend-pr (both)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config git \
+            libsndfile1-dev libpulse-dev libncurses-dev \
+            libusb-1.0-0-dev libfftw3-dev libblas-dev liblapack-dev gfortran \
+            libcodec2-dev librtlsdr-dev libsoapysdr-dev libcurl4-openssl-dev
+
+      - name: Build and install mbelib-neo
+        run: |
+          set -euxo pipefail
+          source tools/ci-dependency-pins.env
+          tools/fetch-pinned-git.sh https://github.com/arancormonk/mbelib-neo "$MBELIB_NEO_SHA" /tmp/mbelib-neo
+          cmake -S /tmp/mbelib-neo -B /tmp/mbelib-neo/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_INSTALL_PREFIX="$HOME/.local"
+          cmake --build /tmp/mbelib-neo/build -j
+          cmake --install /tmp/mbelib-neo/build
+
+      - name: Prepare local dependency environment
+        run: |
+          {
+            echo "PKG_CONFIG_PATH=$HOME/.local/lib/pkgconfig:$HOME/.local/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+            echo "CMAKE_PREFIX_PATH=$HOME/.local:${CMAKE_PREFIX_PATH:-}"
+            echo "LD_LIBRARY_PATH=$HOME/.local/lib:$HOME/.local/lib64:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          set -euxo pipefail
+          log="$RUNNER_TEMP/configure-both.log"
+          cmake --preset dev-debug \
+            -DDSD_ENABLE_RTLSDR=ON \
+            -DDSD_REQUIRE_RTLSDR=ON \
+            -DDSD_ENABLE_SOAPYSDR=ON \
+            -DDSD_REQUIRE_SOAPYSDR=ON \
+            2>&1 | tee "$log"
+          grep -F "RTL-SDR backend enabled: ON (available: ON)" "$log"
+          grep -F "SoapySDR backend enabled: ON (available: ON)" "$log"
+          grep -F "Radio pipeline available: ON" "$log"
+
+      - name: Build
+        run: cmake --build --preset dev-debug -j
+
+      - name: Test
+        run: ctest --preset dev-debug --output-on-failure
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Prepare dependency environment
+        id: prep-env
+        run: |
+          set -euxo pipefail
+          {
+            echo "DEPS_PREFIX=${GITHUB_WORKSPACE}/.deps"
+            echo "PKG_CONFIG_PATH=${GITHUB_WORKSPACE}/.deps/lib/pkgconfig:${GITHUB_WORKSPACE}/.deps/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+            echo "CMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/.deps:${CMAKE_PREFIX_PATH:-}"
+            echo "LD_LIBRARY_PATH=${GITHUB_WORKSPACE}/.deps/lib:${GITHUB_WORKSPACE}/.deps/lib64:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+
+      - name: Compute dependency SHAs (for cache key)
+        id: dep-shas
+        run: |
+          set -euxo pipefail
+          source tools/ci-dependency-pins.env
+          {
+            echo "mbe_sha=$MBELIB_NEO_SHA"
+            echo "codec2_sha=$CODEC2_SHA"
+            echo "rtlsdr_sha=$RTL_SDR_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore dependency cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.DEPS_PREFIX }}
+          key: deps-${{ runner.os }}-${{ steps.dep-shas.outputs.mbe_sha }}-${{ steps.dep-shas.outputs.codec2_sha }}-${{ steps.dep-shas.outputs.rtlsdr_sha }}
+          restore-keys: |
+            deps-${{ runner.os }}-
+
+      - name: Validate dependency cache
+        run: |
+          set -euxo pipefail
+          mf="$DEPS_PREFIX/.manifest"
+          if [ -d "$DEPS_PREFIX" ]; then
+            if [ -f "$mf" ] &&
+               grep -Fxq "mbe_sha=${{ steps.dep-shas.outputs.mbe_sha }}" "$mf" &&
+               grep -Fxq "codec2_sha=${{ steps.dep-shas.outputs.codec2_sha }}" "$mf" &&
+               grep -Fxq "rtlsdr_sha=${{ steps.dep-shas.outputs.rtlsdr_sha }}" "$mf"; then
+              echo "Dependency cache manifest matches requested SHAs"
+            else
+              echo "Dependency cache manifest is missing or stale; clearing $DEPS_PREFIX"
+              rm -rf "$DEPS_PREFIX"
+            fi
+          fi
+          mkdir -p "$DEPS_PREFIX"
+
+      - name: Install base build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config git ccache \
+            libsndfile1-dev libpulse-dev libncurses-dev \
+            libusb-1.0-0-dev libfftw3-dev libblas-dev liblapack-dev \
+            gfortran libcurl4-openssl-dev
+
+      - name: Prepare ccache environment
+        id: prep-ccache
+        run: |
+          set -euxo pipefail
+          {
+            echo "CCACHE_DIR=${GITHUB_WORKSPACE}/.ccache"
+            echo "CC=ccache gcc"
+            echo "CXX=ccache g++"
+            echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
+            echo "CCACHE_NOHASHDIR=true"
+            echo "CCACHE_SLOPPINESS=time_macros"
+          } >> "$GITHUB_ENV"
+          mkdir -p "${GITHUB_WORKSPACE}/.ccache"
+
+      - name: Compute tool versions (for ccache key)
+        id: toolver
+        run: |
+          set -euxo pipefail
+          {
+            echo "gcc_ver=$(gcc -dumpfullversion -dumpversion || gcc --version | head -n1)"
+            echo "cmake_ver=$(cmake --version | head -n1 | awk '{print $3}')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore ccache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ github.job }}-${{ steps.toolver.outputs.gcc_ver }}-${{ steps.toolver.outputs.cmake_ver }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ github.job }}-${{ steps.toolver.outputs.gcc_ver }}-${{ steps.toolver.outputs.cmake_ver }}-
+            ccache-${{ runner.os }}-${{ github.job }}-
+            ccache-${{ runner.os }}-
+
+      - name: Initialize ccache
+        run: |
+          ccache --version
+          ccache --zero-stats
+          ccache --set-config=max_size=500M
+          ccache --set-config=compression=true
+
+      - name: Install dependencies via APT when available (codec2, rtl-sdr, soapy)
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            libcodec2-dev librtlsdr-dev libsoapysdr-dev || true
+
+      - name: Build and install mbelib-neo (required, cached)
+        run: |
+          set -euxo pipefail
+          mf="$DEPS_PREFIX/.manifest"
+          want_sha='${{ steps.dep-shas.outputs.mbe_sha }}'
+          pc1="$DEPS_PREFIX/lib/pkgconfig/libmbe-neo.pc"
+          pc2="$DEPS_PREFIX/lib64/pkgconfig/libmbe-neo.pc"
+          if [ -f "$pc1" ] || [ -f "$pc2" ]; then
+            if [ -f "$mf" ] && grep -q "^mbe_sha=$want_sha$" "$mf"; then
+              echo "Using cached mbelib-neo in $DEPS_PREFIX"
+              exit 0
+            fi
+            echo "Cached mbelib-neo does not match desired SHA; rebuilding"
+          fi
+          tools/fetch-pinned-git.sh https://github.com/arancormonk/mbelib-neo "$want_sha" /tmp/mbelib-neo
+          cmake -S /tmp/mbelib-neo -B /tmp/mbelib-neo/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX"
+          cmake --build /tmp/mbelib-neo/build -j
+          cmake --install /tmp/mbelib-neo/build
+
+      - name: Ensure codec2 (cached fallback if not found)
+        run: |
+          set -euxo pipefail
+          mf="$DEPS_PREFIX/.manifest"
+          want_sha='${{ steps.dep-shas.outputs.codec2_sha }}'
+          pc1="$DEPS_PREFIX/lib/pkgconfig/codec2.pc"
+          pc2="$DEPS_PREFIX/lib64/pkgconfig/codec2.pc"
+          if [ -f "$pc1" ] || [ -f "$pc2" ]; then
+            if [ -f "$mf" ] && grep -q "^codec2_sha=$want_sha$" "$mf"; then
+              echo "Using cached codec2 in $DEPS_PREFIX"
+              exit 0
+            fi
+            echo "Cached codec2 does not match desired SHA; rebuilding"
+          else
+            if pkg-config --exists codec2; then
+              echo "Using system codec2"
+              exit 0
+            fi
+          fi
+          tools/fetch-pinned-git.sh https://github.com/arancormonk/codec2 "$want_sha" /tmp/codec2
+          cmake -S /tmp/codec2 -B /tmp/codec2/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX"
+          cmake --build /tmp/codec2/build -j
+          cmake --install /tmp/codec2/build
+
+      - name: Ensure RTL-SDR (cached fallback if pkg-config not found)
+        run: |
+          set -euxo pipefail
+          mf="$DEPS_PREFIX/.manifest"
+          want_sha='${{ steps.dep-shas.outputs.rtlsdr_sha }}'
+          pc1="$DEPS_PREFIX/lib/pkgconfig/librtlsdr.pc"
+          pc2="$DEPS_PREFIX/lib64/pkgconfig/librtlsdr.pc"
+          if [ -f "$pc1" ] || [ -f "$pc2" ]; then
+            if [ -f "$mf" ] && grep -q "^rtlsdr_sha=$want_sha$" "$mf"; then
+              echo "Using cached rtl-sdr in $DEPS_PREFIX"
+              exit 0
+            fi
+            echo "Cached rtl-sdr does not match desired SHA; rebuilding"
+          else
+            if pkg-config --exists librtlsdr; then
+              echo "Using system rtl-sdr"
+              exit 0
+            fi
+          fi
+          tools/fetch-pinned-git.sh https://github.com/arancormonk/rtl-sdr "$want_sha" /tmp/rtl-sdr
+          cmake -S /tmp/rtl-sdr -B /tmp/rtl-sdr/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDETACH_KERNEL_DRIVER=ON -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX"
+          cmake --build /tmp/rtl-sdr/build -j
+          cmake --install /tmp/rtl-sdr/build
+
+      - name: Update deps manifest
+        run: |
+          set -euxo pipefail
+          mkdir -p "$DEPS_PREFIX"
+          mf="$DEPS_PREFIX/.manifest"
+          {
+            echo "mbe_sha=${{ steps.dep-shas.outputs.mbe_sha }}"
+            echo "codec2_sha=${{ steps.dep-shas.outputs.codec2_sha }}"
+            echo "rtlsdr_sha=${{ steps.dep-shas.outputs.rtlsdr_sha }}"
+            echo "updated=$(date -u +%FT%TZ)"
+          } > "$mf"
+
+      - name: Show dependency versions
+        run: |
+          pkg-config --modversion codec2 || true
+          pkg-config --modversion librtlsdr || true
+          pkg-config --modversion SoapySDR || true
+          ldconfig -p | grep -E 'libsndfile|libpulse|ncursesw' || true
+
+      - name: Configure (Release preset)
+        run: |
+          cmake --preset dev-release \
+            -DDSD_REQUIRE_RTLSDR=ON \
+            -DDSD_REQUIRE_SOAPYSDR=ON
+
+      - name: Build
+        run: |
+          cmake --build --preset dev-release -j
+
+      - name: Smoke test - show CLI help
+        run: |
+          ./build/dev-release/apps/dsd-cli/dsd-neo -h
+
+      - name: Verify release hardening
+        run: |
+          tools/check_release_hardening.sh build/dev-release/apps/dsd-cli/dsd-neo build/dev-release
+
+      - name: Show ccache stats
+        if: always()
+        run: ccache -s
+
+  scan-build:
+    name: scan-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Run scan-build under Arch toolchain
+        run: |
+          bash tools/ci_arch_toolchain.sh bash -lc '
+            set -euxo pipefail
+            source tools/ci-dependency-pins.env
+            tools/fetch-pinned-git.sh https://github.com/arancormonk/mbelib-neo "$MBELIB_NEO_SHA" /tmp/mbelib-neo
+            cmake -S /tmp/mbelib-neo -B /tmp/mbelib-neo/build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_SHARED_LIBS=ON \
+              -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX"
+            cmake --build /tmp/mbelib-neo/build -j
+            cmake --install /tmp/mbelib-neo/build
+            tools/scan_build.sh --strict \
+              --cmake-arg -DDSD_REQUIRE_RTLSDR=ON \
+              --cmake-arg -DDSD_REQUIRE_SOAPYSDR=ON
+          '
+
+      - name: Upload scan-build output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scan-build-report
+          path: |
+            .scan-build.local.out
+            .scan-build.local
+          include-hidden-files: true
+          retention-days: 7
+
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Compute PR changed files
+        if: github.event_name == 'pull_request'
+        id: changed
+        run: |
+          tools/ci_changed_files.sh \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head HEAD \
+            --no-header-expansion
+
+      - name: Skip Semgrep
+        if: github.event_name == 'pull_request' && steps.changed.outputs.semgrep_targets == '0'
+        run: echo "No changed paths for Semgrep."
+
+      - name: Set up Python
+        if: github.event_name != 'pull_request' || steps.changed.outputs.semgrep_targets != '0'
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: .github/requirements/semgrep.txt
+
+      - name: Install Semgrep
+        if: github.event_name != 'pull_request' || steps.changed.outputs.semgrep_targets != '0'
+        run: python -m pip install --require-hashes -r .github/requirements/semgrep.txt
+
+      - name: Run Semgrep
+        if: github.event_name != 'pull_request' || steps.changed.outputs.semgrep_targets != '0'
+        shell: bash
+        env:
+          DSD_SEMGREP_SARIF_OUT: .semgrep.sarif
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            mapfile -t targets < .ci/changed-files/semgrep_targets.txt
+            tools/semgrep.sh --strict -- "${targets[@]}"
+          else
+            tools/semgrep.sh --strict
+          fi
+
+      - name: Upload Semgrep SARIF
+        if: always() && hashFiles('.semgrep.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          sarif_file: .semgrep.sarif
+
+      - name: Upload Semgrep output
+        if: always() && (github.event_name != 'pull_request' || steps.changed.outputs.semgrep_targets != '0')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: semgrep-report
+          path: |
+            .semgrep.local.out
+            .semgrep.sarif
+          include-hidden-files: true
+          retention-days: 7
+
+  lizard:
+    name: lizard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: .github/requirements/lizard.txt
+      - name: Install Lizard
+        run: python -m pip install --require-hashes -r .github/requirements/lizard.txt
+      - name: Run Lizard
+        run: tools/lizard.sh --strict
+      - name: Upload Lizard output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lizard-report
+          path: .lizard.local.out
+          include-hidden-files: true
+          retention-days: 7
+
+  validate-release-tag:
+    name: Validate release tag
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.verify.outputs.version }}
+      archive_prefix: ${{ steps.verify.outputs.archive_prefix }}
+      release_title: ${{ steps.verify.outputs.release_title }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Verify tag matches project version
+        id: verify
+        shell: bash
+        env:
+          RELEASE_TAG_CREATED: ${{ github.event.created }}
+        run: tools/ci_validate_release_tag.sh
+
+  update-nightly-tag:
+    name: Update nightly tag
+    needs: [build-linux]
+    runs-on: ubuntu-latest
+    if: >-
+      github.repository == 'arancormonk/dsd-neo' &&
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Move nightly tag to current commit
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          ts=$(date -u +%FT%TZ)
+          if git rev-parse -q --verify refs/tags/nightly >/dev/null; then
+            git tag -fa nightly -m "nightly $ts" HEAD
+          else
+            git tag -a nightly -m "nightly $ts" HEAD
+          fi
+          git push --force origin refs/tags/nightly
+
+  update-aur-git:
+    name: Update AUR package (git)
+    needs: [build-linux, validate-release-tag]
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel@sha256:25074821d28e54a0bbbd87a88d392f1489be9bd815ee5c60744be6e57fd500d8
+    env:
+      AUR_MAKEPKG_USER: aurbuilder
+    defaults:
+      run:
+        shell: bash
+    # Run on upstream non-PR refs. For version tags, only proceed after release validation succeeds.
+    if: >-
+      ${{
+        always() &&
+        github.repository == 'arancormonk/dsd-neo' &&
+        github.event_name != 'pull_request' &&
+        needs.build-linux.result == 'success' &&
+        (
+          !startsWith(github.ref, 'refs/tags/v') ||
+          needs.validate-release-tag.result == 'success'
+        )
+      }}
+    steps:
+      - name: Check AUR SSH key availability
+        id: aur_key
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            echo "AUR_SSH_PRIVATE_KEY is not set; skipping AUR update steps."
+          else
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install AUR tooling
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: pacman -Syu --noconfirm --needed git openssh
+
+      - name: Create makepkg user
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          if ! id -u "$AUR_MAKEPKG_USER" >/dev/null 2>&1; then
+            useradd --create-home --shell /bin/bash "$AUR_MAKEPKG_USER"
+          fi
+
+      - name: Checkout repository
+        if: steps.aur_key.outputs.has_key == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Mark workspace as safe
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Refresh latest main ref
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: git fetch --force origin refs/heads/main:refs/remotes/origin/main --tags
+
+      - name: Setup SSH for AUR
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          mkdir -p "$HOME/.ssh"
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > "$HOME/.ssh/aur"
+          chmod 600 "$HOME/.ssh/aur"
+          ssh-keyscan -t ed25519 aur.archlinux.org >> "$HOME/.ssh/known_hosts"
+
+      - name: Clone AUR package
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          aur_ssh_command="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+          GIT_SSH_COMMAND="$aur_ssh_command" git clone ssh://aur@aur.archlinux.org/dsd-neo-git.git aur-package
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/aur-package"
+
+      - name: Compute new pkgver
+        id: pkgver
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          ref="origin/main"
+          new_pkgver="$(
+            (
+              set -o pipefail
+              git describe --long --tags --abbrev=7 --match 'v[0-9]*.[0-9]*.[0-9]*' "$ref" 2>/dev/null |
+                sed 's/^v//;s/-/.r/;s/-/./'
+            ) || printf "r%s.%s" "$(git rev-list --count "$ref")" "$(git rev-parse --short=7 "$ref")"
+          )"
+          echo "pkgver=$new_pkgver" >> "$GITHUB_OUTPUT"
+          echo "Computed pkgver from $ref ($(git rev-parse --short=7 "$ref")): $new_pkgver"
+
+      - name: Validate AUR VCS metadata
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          set -euo pipefail
+          cd aur-package
+          expected="${{ steps.pkgver.outputs.pkgver }}"
+          if ! grep -Fq 'git+https://github.com/arancormonk/dsd-neo.git#branch=main' PKGBUILD; then
+            echo "AUR PKGBUILD must explicitly track the upstream main branch." >&2
+            exit 1
+          fi
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cp -a . "$tmp/aur-package"
+          chown -R "$AUR_MAKEPKG_USER:$AUR_MAKEPKG_USER" "$tmp"
+          runuser -u "$AUR_MAKEPKG_USER" -- bash -lc "set -o pipefail; cd '$tmp/aur-package' && makepkg --nobuild --nodeps --skipinteg --noconfirm 2>&1 | tee makepkg.out"
+          actual="$(awk '/==> Updated version:/ { ver=$NF } END { sub(/-[^-]*$/, "", ver); print ver }' "$tmp/aur-package/makepkg.out")"
+          if [ -z "$actual" ]; then
+            actual="$(sed -n 's/^pkgver=//p' "$tmp/aur-package/PKGBUILD" | head -n1)"
+          fi
+          echo "Expected pkgver: $expected"
+          echo "Actual makepkg pkgver: $actual"
+          if [ "$actual" != "$expected" ]; then
+            echo "AUR PKGBUILD pkgver() is incompatible with CI-computed pkgver." >&2
+            exit 1
+          fi
+
+      - name: Check if update needed
+        id: check
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          cd aur-package
+          current_pkgver=$(grep -E '^\s*pkgver=' PKGBUILD | sed 's/.*pkgver=//')
+          echo "Current pkgver: $current_pkgver"
+          echo "New pkgver: ${{ steps.pkgver.outputs.pkgver }}"
+          if [ "$current_pkgver" = "${{ steps.pkgver.outputs.pkgver }}" ]; then
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "No update needed"
+          else
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+            echo "Update needed"
+          fi
+
+      - name: Update PKGBUILD
+        if: steps.aur_key.outputs.has_key == 'true' && steps.check.outputs.needs_update == 'true'
+        run: |
+          set -euo pipefail
+          cd aur-package
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.pkgver.outputs.pkgver }}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          chown -R "$AUR_MAKEPKG_USER:$AUR_MAKEPKG_USER" .
+          runuser -u "$AUR_MAKEPKG_USER" -- bash -lc "cd '$PWD' && makepkg --printsrcinfo > .SRCINFO"
+
+      - name: Commit and push to AUR
+        if: steps.aur_key.outputs.has_key == 'true' && steps.check.outputs.needs_update == 'true'
+        run: |
+          cd aur-package
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to ${{ steps.pkgver.outputs.pkgver }}"
+          aur_ssh_command="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+          GIT_SSH_COMMAND="$aur_ssh_command" git push origin master
+
+  update-aur-release:
+    name: Update AUR package (release)
+    needs: [build-linux, validate-release-tag]
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel@sha256:25074821d28e54a0bbbd87a88d392f1489be9bd815ee5c60744be6e57fd500d8
+    env:
+      AUR_MAKEPKG_USER: aurbuilder
+    defaults:
+      run:
+        shell: bash
+    if: >-
+      ${{
+        github.repository == 'arancormonk/dsd-neo' &&
+        github.event_name != 'pull_request' &&
+        startsWith(github.ref, 'refs/tags/v') &&
+        needs.build-linux.result == 'success' &&
+        needs.validate-release-tag.result == 'success'
+      }}
+    steps:
+      - name: Check AUR SSH key availability
+        id: aur_key
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            echo "AUR_SSH_PRIVATE_KEY is not set; skipping AUR update steps."
+          else
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install AUR tooling
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: pacman -Syu --noconfirm --needed git openssh curl
+
+      - name: Create makepkg user
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          if ! id -u "$AUR_MAKEPKG_USER" >/dev/null 2>&1; then
+            useradd --create-home --shell /bin/bash "$AUR_MAKEPKG_USER"
+          fi
+
+      - name: Checkout repository
+        if: steps.aur_key.outputs.has_key == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Mark workspace as safe
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Setup SSH for AUR
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          mkdir -p "$HOME/.ssh"
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > "$HOME/.ssh/aur"
+          chmod 600 "$HOME/.ssh/aur"
+          ssh-keyscan -t ed25519 aur.archlinux.org >> "$HOME/.ssh/known_hosts"
+
+      - name: Clone AUR package
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          aur_ssh_command="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+          GIT_SSH_COMMAND="$aur_ssh_command" git clone ssh://aur@aur.archlinux.org/dsd-neo.git aur-package
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/aur-package"
+
+      - name: Compute release metadata
+        id: release_meta
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          pkgver="${GITHUB_REF_NAME#v}"
+          source_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          sha256="$(
+            set -o pipefail
+            curl -fsSL "$source_url" | sha256sum | awk '{print $1}'
+          )"
+          echo "pkgver=$pkgver" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          echo "Computed release metadata: pkgver=$pkgver sha256=$sha256"
+
+      - name: Ensure PKGBUILD exists
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          set -euo pipefail
+          cd aur-package
+          if [ -f PKGBUILD ]; then
+            exit 0
+          fi
+          cat > PKGBUILD <<'PKGBUILD'
+          pkgname=dsd-neo
+          pkgver=0.0.0
+          pkgrel=1
+          pkgdesc="Digital Speech Decoder - A modern, modular, and performance enhanced C/C++ decoder for digital voice. DMR, P25, NXDN, YSF, and more."
+          arch=('x86_64' 'aarch64')
+          url="https://github.com/arancormonk/dsd-neo"
+          license=('GPL-3.0-or-later')
+          depends=(
+              'mbelib-neo'
+              'libsndfile'
+              'ncurses'
+              'libpulse'
+              'rtl-sdr'
+              'soapysdr'
+              'codec2'
+              'curl'
+          )
+          makedepends=(
+              'cmake'
+              'help2man'
+          )
+          conflicts=('dsd-neo-git')
+          source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+          sha256sums=('SKIP')
+
+          build() {
+              cmake -B build -S "$pkgname-$pkgver" \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -DCMAKE_INSTALL_PREFIX=/usr \
+                  -DBUILD_TESTING=OFF \
+                  -Wno-dev
+              cmake --build build
+          }
+
+          package() {
+              DESTDIR="$pkgdir" cmake --install build
+          }
+          PKGBUILD
+
+      - name: Check if update needed
+        id: check
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          cd aur-package
+          current_pkgver=$(sed -n 's/^pkgver=//p' PKGBUILD | head -n1)
+          current_sha256=$(sed -n "s/^sha256sums=('\\([0-9a-f]\\{64\\}\\)').*/\\1/p" PKGBUILD | head -n1)
+          echo "Current pkgver: $current_pkgver"
+          echo "Current sha256: $current_sha256"
+          echo "New pkgver: ${{ steps.release_meta.outputs.pkgver }}"
+          echo "New sha256: ${{ steps.release_meta.outputs.sha256 }}"
+          if [ "$current_pkgver" = "${{ steps.release_meta.outputs.pkgver }}" ] &&
+             [ "$current_sha256" = "${{ steps.release_meta.outputs.sha256 }}" ]; then
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "No update needed"
+          else
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+            echo "Update needed"
+          fi
+
+      - name: Update PKGBUILD
+        if: steps.aur_key.outputs.has_key == 'true' && steps.check.outputs.needs_update == 'true'
+        run: |
+          set -euo pipefail
+          cd aur-package
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.release_meta.outputs.pkgver }}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.release_meta.outputs.sha256 }}')/" PKGBUILD
+          chown -R "$AUR_MAKEPKG_USER:$AUR_MAKEPKG_USER" .
+          runuser -u "$AUR_MAKEPKG_USER" -- bash -lc "cd '$PWD' && makepkg --printsrcinfo > .SRCINFO"
+
+      - name: Validate AUR release source
+        if: steps.aur_key.outputs.has_key == 'true' && steps.check.outputs.needs_update == 'true'
+        run: |
+          set -euo pipefail
+          cd aur-package
+          runuser -u "$AUR_MAKEPKG_USER" -- bash -lc "cd '$PWD' && makepkg --verifysource --nodeps --noconfirm"
+
+      - name: Commit and push to AUR
+        if: steps.aur_key.outputs.has_key == 'true' && steps.check.outputs.needs_update == 'true'
+        run: |
+          cd aur-package
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to ${{ steps.release_meta.outputs.pkgver }}"
+          aur_ssh_command="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+          GIT_SSH_COMMAND="$aur_ssh_command" git push origin master
+
+  sanitize-linux:
+    name: Linux • Debug • sanitizer (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: asan-ubsan
+            preset: asan-ubsan-debug
+            cc: gcc
+            cxx: g++
+          - name: tsan
+            preset: tsan-debug
+            cc: clang
+            cxx: clang++
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Prepare dependency environment
+        run: |
+          set -euxo pipefail
+          {
+            echo "DEPS_PREFIX=${GITHUB_WORKSPACE}/.deps"
+            echo "PKG_CONFIG_PATH=${GITHUB_WORKSPACE}/.deps/lib/pkgconfig:${GITHUB_WORKSPACE}/.deps/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+            echo "CMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/.deps:${CMAKE_PREFIX_PATH:-}"
+            echo "LD_LIBRARY_PATH=${GITHUB_WORKSPACE}/.deps/lib:${GITHUB_WORKSPACE}/.deps/lib64:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+
+      - name: Compute dependency SHAs (for cache key)
+        id: dep-shas
+        run: |
+          set -euxo pipefail
+          source tools/ci-dependency-pins.env
+          {
+            echo "mbe_sha=$MBELIB_NEO_SHA"
+            echo "codec2_sha=$CODEC2_SHA"
+            echo "rtlsdr_sha=$RTL_SDR_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore dependency cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.DEPS_PREFIX }}
+          key: deps-${{ runner.os }}-${{ steps.dep-shas.outputs.mbe_sha }}-${{ steps.dep-shas.outputs.codec2_sha }}-${{ steps.dep-shas.outputs.rtlsdr_sha }}
+          restore-keys: |
+            deps-${{ runner.os }}-
+
+      - name: Validate dependency cache
+        run: |
+          set -euxo pipefail
+          mf="$DEPS_PREFIX/.manifest"
+          if [ -d "$DEPS_PREFIX" ]; then
+            if [ -f "$mf" ] &&
+               grep -Fxq "mbe_sha=${{ steps.dep-shas.outputs.mbe_sha }}" "$mf" &&
+               grep -Fxq "codec2_sha=${{ steps.dep-shas.outputs.codec2_sha }}" "$mf" &&
+               grep -Fxq "rtlsdr_sha=${{ steps.dep-shas.outputs.rtlsdr_sha }}" "$mf"; then
+              echo "Dependency cache manifest matches requested SHAs"
+            else
+              echo "Dependency cache manifest is missing or stale; clearing $DEPS_PREFIX"
+              rm -rf "$DEPS_PREFIX"
+            fi
+          fi
+          mkdir -p "$DEPS_PREFIX"
+
+      - name: Install base build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang cmake ninja-build pkg-config git ccache \
+            libsndfile1-dev libpulse-dev libncurses-dev \
+            libusb-1.0-0-dev libfftw3-dev libblas-dev liblapack-dev \
+            gfortran libcurl4-openssl-dev
+
+      - name: Prepare ccache environment
+        run: |
+          set -euxo pipefail
+          {
+            echo "CCACHE_DIR=${GITHUB_WORKSPACE}/.ccache"
+            echo "CC=ccache ${{ matrix.cc }}"
+            echo "CXX=ccache ${{ matrix.cxx }}"
+            echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
+            echo "CCACHE_NOHASHDIR=true"
+            echo "CCACHE_SLOPPINESS=time_macros"
+          } >> "$GITHUB_ENV"
+          mkdir -p "${GITHUB_WORKSPACE}/.ccache"
+
+      - name: Compute tool versions (for ccache key)
+        id: toolver-sanitize
+        run: |
+          set -euxo pipefail
+          {
+            echo "compiler_ver=$(${{ matrix.cc }} --version | head -n1 | tr ' /' '__')"
+            echo "cmake_ver=$(cmake --version | head -n1 | awk '{print $3}')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore ccache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-${{ steps.toolver-sanitize.outputs.compiler_ver }}-${{ steps.toolver-sanitize.outputs.cmake_ver }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-${{ steps.toolver-sanitize.outputs.compiler_ver }}-${{ steps.toolver-sanitize.outputs.cmake_ver }}-
+            ccache-${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-
+            ccache-${{ runner.os }}-${{ github.job }}-
+            ccache-${{ runner.os }}-
+
+      - name: Initialize ccache
+        run: |
+          ccache --version
+          ccache --zero-stats
+          ccache --set-config=max_size=500M
+          ccache --set-config=compression=true
+
+      - name: Install dependencies via APT when available (codec2, rtl-sdr)
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            libcodec2-dev librtlsdr-dev || true
+
+      - name: Build and install mbelib-neo (required, cached)
+        run: |
+          set -euxo pipefail
+          mf="$DEPS_PREFIX/.manifest"
+          want_sha='${{ steps.dep-shas.outputs.mbe_sha }}'
+          pc1="$DEPS_PREFIX/lib/pkgconfig/libmbe-neo.pc"
+          pc2="$DEPS_PREFIX/lib64/pkgconfig/libmbe-neo.pc"
+          if [ -f "$pc1" ] || [ -f "$pc2" ]; then
+            if [ -f "$mf" ] && grep -q "^mbe_sha=$want_sha$" "$mf"; then
+              echo "Using cached mbelib-neo in $DEPS_PREFIX"
+              exit 0
+            fi
+            echo "Cached mbelib-neo does not match desired SHA; rebuilding"
+          fi
+          tools/fetch-pinned-git.sh https://github.com/arancormonk/mbelib-neo "$want_sha" /tmp/mbelib-neo
+          cmake -S /tmp/mbelib-neo -B /tmp/mbelib-neo/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX"
+          cmake --build /tmp/mbelib-neo/build -j
+          cmake --install /tmp/mbelib-neo/build
+
+      - name: Ensure codec2 (cached fallback if not found)
+        run: |
+          set -euxo pipefail
+          mf="$DEPS_PREFIX/.manifest"
+          want_sha='${{ steps.dep-shas.outputs.codec2_sha }}'
+          pc1="$DEPS_PREFIX/lib/pkgconfig/codec2.pc"
+          pc2="$DEPS_PREFIX/lib64/pkgconfig/codec2.pc"
+          if [ -f "$pc1" ] || [ -f "$pc2" ]; then
+            if [ -f "$mf" ] && grep -q "^codec2_sha=$want_sha$" "$mf"; then
+              echo "Using cached codec2 in $DEPS_PREFIX"
+              exit 0
+            fi
+            echo "Cached codec2 does not match desired SHA; rebuilding"
+          else
+            if pkg-config --exists codec2; then
+              echo "Using system codec2"
+              exit 0
+            fi
+          fi
+          tools/fetch-pinned-git.sh https://github.com/arancormonk/codec2 "$want_sha" /tmp/codec2
+          cmake -S /tmp/codec2 -B /tmp/codec2/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX"
+          cmake --build /tmp/codec2/build -j
+          cmake --install /tmp/codec2/build
+
+      - name: Ensure RTL-SDR (cached fallback if pkg-config not found)
+        run: |
+          set -euxo pipefail
+          mf="$DEPS_PREFIX/.manifest"
+          want_sha='${{ steps.dep-shas.outputs.rtlsdr_sha }}'
+          pc1="$DEPS_PREFIX/lib/pkgconfig/librtlsdr.pc"
+          pc2="$DEPS_PREFIX/lib64/pkgconfig/librtlsdr.pc"
+          if [ -f "$pc1" ] || [ -f "$pc2" ]; then
+            if [ -f "$mf" ] && grep -q "^rtlsdr_sha=$want_sha$" "$mf"; then
+              echo "Using cached rtl-sdr in $DEPS_PREFIX"
+              exit 0
+            fi
+            echo "Cached rtl-sdr does not match desired SHA; rebuilding"
+          else
+            if pkg-config --exists librtlsdr; then
+              echo "Using system rtl-sdr"
+              exit 0
+            fi
+          fi
+          tools/fetch-pinned-git.sh https://github.com/arancormonk/rtl-sdr "$want_sha" /tmp/rtl-sdr
+          cmake -S /tmp/rtl-sdr -B /tmp/rtl-sdr/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDETACH_KERNEL_DRIVER=ON -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX"
+          cmake --build /tmp/rtl-sdr/build -j
+          cmake --install /tmp/rtl-sdr/build
+
+      - name: Update deps manifest
+        run: |
+          set -euxo pipefail
+          mkdir -p "$DEPS_PREFIX"
+          mf="$DEPS_PREFIX/.manifest"
+          {
+            echo "mbe_sha=${{ steps.dep-shas.outputs.mbe_sha }}"
+            echo "codec2_sha=${{ steps.dep-shas.outputs.codec2_sha }}"
+            echo "rtlsdr_sha=${{ steps.dep-shas.outputs.rtlsdr_sha }}"
+            echo "updated=$(date -u +%FT%TZ)"
+          } > "$mf"
+
+      - name: Configure (${{ matrix.preset }})
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build (${{ matrix.preset }})
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+
+      - name: Test (${{ matrix.preset }})
+        run: |
+          set -euxo pipefail
+          if [[ "${{ matrix.name }}" == "tsan" ]]; then
+            export TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1:history_size=7:suppressions=${GITHUB_WORKSPACE}/tools/tsan.supp"
+          else
+            export ASAN_OPTIONS="detect_leaks=1:halt_on_error=1:strict_string_checks=1"
+            export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
+          fi
+          ctest --preset ${{ matrix.preset }} --output-on-failure
+
+      - name: Show ccache stats
+        if: always()
+        run: ccache -s
+
+  cmake-install-rules:
+    name: cmake install rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Check install(TARGETS) runtime destinations
+        run: tools/check_install_runtime_destinations.sh
+
+  format-check:
+    name: clang-format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Compute PR changed files
+        if: github.event_name == 'pull_request'
+        id: changed
+        run: |
+          tools/ci_changed_files.sh \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head HEAD \
+            --no-header-expansion
+
+      - name: Skip clang-format
+        if: github.event_name == 'pull_request' && steps.changed.outputs.format_files == '0'
+        run: echo "No C/C++ files to check."
+
+      - name: Check formatting
+        if: github.event_name != 'pull_request' || steps.changed.outputs.format_files != '0'
+        shell: bash
+        run: |
+          bash tools/ci_arch_toolchain.sh bash -lc '
+            set -euo pipefail
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              mapfile -t files < .ci/changed-files/format_files.txt
+            else
+              mapfile -t files < <(
+                git ls-files \
+                  "*.c" "*.cc" "*.cxx" "*.cpp" "*.h" "*.hpp" \
+                  ":!:build/**" \
+                  ":!:src/third_party/**"
+              )
+            fi
+
+            clang-format --version
+            rc=0
+            for f in "${files[@]}"; do
+              if clang-format -n --Werror "$f" >/dev/null 2>&1; then
+                continue
+              fi
+              if ! diff -u "$f" <(clang-format "$f") >/dev/null; then
+                echo "Formatting issues found in ${f}"
+                rc=1
+              fi
+            done
+            if [[ $rc -ne 0 ]]; then
+              echo "Run tools/format.sh."
+              exit 1
+            fi
+            echo "Formatting OK"
+          '
+
+  cppcheck:
+    name: cppcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Install PR diff dependencies
+        if: github.event_name == 'pull_request'
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Compute PR changed files
+        if: github.event_name == 'pull_request'
+        id: changed
+        run: |
+          tools/ci_changed_files.sh \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head HEAD
+
+      - name: Skip cppcheck
+        if: github.event_name == 'pull_request' && steps.changed.outputs.cppcheck_sources == '0'
+        run: echo "No changed source files for cppcheck."
+
+      - name: Run cppcheck
+        if: github.event_name != 'pull_request' || steps.changed.outputs.cppcheck_sources != '0'
+        shell: bash
+        run: |
+          bash tools/ci_arch_toolchain.sh bash -lc '
+            set -euo pipefail
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              mapfile -t files < .ci/changed-files/cppcheck_sources.txt
+              tools/cppcheck.sh --strict -- "${files[@]}"
+            else
+              tools/cppcheck.sh --strict
+            fi
+          '
+
+      - name: Upload cppcheck output
+        if: always() && (github.event_name != 'pull_request' || steps.changed.outputs.cppcheck_sources != '0')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cppcheck-report
+          path: .cppcheck.local.out
+          include-hidden-files: true
+          retention-days: 7
+
+  static-analysis:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: clang-tidy
+            run_cmd: tools/clang_tidy.sh
+            artifact_name: clang-tidy-report
+            artifact_path: .clang-tidy.local.out
+          - name: iwyu
+            run_cmd: tools/iwyu.sh --strict
+            artifact_name: iwyu-report
+            artifact_path: .iwyu.local.out
+          - name: gcc-fanalyzer
+            run_cmd: tools/gcc_fanalyzer.sh --strict
+            artifact_name: gcc-fanalyzer-report
+            artifact_path: .gcc-fanalyzer.local.out
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Install PR diff dependencies
+        if: github.event_name == 'pull_request'
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Compute PR changed files
+        if: github.event_name == 'pull_request'
+        id: changed
+        run: |
+          tools/ci_changed_files.sh \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head HEAD
+
+      - name: Skip ${{ matrix.name }}
+        if: github.event_name == 'pull_request' && steps.changed.outputs.analysis_tus == '0'
+        run: echo "No changed translation units for ${{ matrix.name }}."
+
+      - name: Compute dependency SHAs (for cache key)
+        if: github.event_name != 'pull_request' || steps.changed.outputs.analysis_tus != '0'
+        id: dep-shas
+        run: |
+          set -euxo pipefail
+          source tools/ci-dependency-pins.env
+          {
+            echo "mbe_sha=$MBELIB_NEO_SHA"
+            echo "iwyu_sha=$IWYU_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore dependency cache
+        if: github.event_name != 'pull_request' || steps.changed.outputs.analysis_tus != '0'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .deps
+          key: arch-deps-${{ runner.os }}-${{ steps.dep-shas.outputs.mbe_sha }}
+          restore-keys: |
+            arch-deps-${{ runner.os }}-
+
+      - name: Validate dependency cache
+        if: github.event_name != 'pull_request' || steps.changed.outputs.analysis_tus != '0'
+        run: |
+          set -euxo pipefail
+          mf=".deps/.manifest"
+          if [ -d .deps ]; then
+            if [ -f "$mf" ] &&
+               grep -Fxq "mbe_sha=${{ steps.dep-shas.outputs.mbe_sha }}" "$mf"; then
+              echo "Dependency cache manifest matches requested SHAs"
+            else
+              echo "Dependency cache manifest is missing or stale; clearing .deps"
+              rm -rf .deps
+            fi
+          fi
+          mkdir -p .deps
+
+      - name: Restore IWYU toolchain cache
+        if: (github.event_name != 'pull_request' || steps.changed.outputs.analysis_tus != '0') && matrix.name == 'iwyu'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .deps-arch-toolchain
+          key: arch-iwyu-${{ runner.os }}-${{ steps.dep-shas.outputs.iwyu_sha }}
+          restore-keys: |
+            arch-iwyu-${{ runner.os }}-
+
+      - name: Restore ccache
+        if: github.event_name != 'pull_request' || steps.changed.outputs.analysis_tus != '0'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-arch-${{ github.job }}-${{ matrix.name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-arch-${{ github.job }}-${{ matrix.name }}-
+            ccache-${{ runner.os }}-arch-${{ github.job }}-
+            ccache-${{ runner.os }}-arch-
+
+      - name: Run ${{ matrix.name }} under Arch toolchain
+        if: github.event_name != 'pull_request' || steps.changed.outputs.analysis_tus != '0'
+        shell: bash
+        env:
+          CI_ARCH_IWYU_SHA: ${{ steps.dep-shas.outputs.iwyu_sha }}
+        run: |
+          bash tools/ci_arch_toolchain.sh bash -lc '
+            set -euxo pipefail
+
+            ccache --version
+            ccache --zero-stats
+            ccache --set-config=max_size=500M
+            ccache --set-config=compression=true
+            export CC="ccache gcc"
+            export CXX="ccache g++"
+
+            mf="$DEPS_PREFIX/.manifest"
+            want_sha="${{ steps.dep-shas.outputs.mbe_sha }}"
+            pc1="$DEPS_PREFIX/lib/pkgconfig/libmbe-neo.pc"
+            pc2="$DEPS_PREFIX/lib64/pkgconfig/libmbe-neo.pc"
+            if [ -f "$pc1" ] || [ -f "$pc2" ]; then
+              if [ -f "$mf" ] && grep -q "^mbe_sha=$want_sha$" "$mf"; then
+                echo "Using cached mbelib-neo in $DEPS_PREFIX"
+              else
+                echo "Cached mbelib-neo does not match desired SHA; rebuilding"
+                rm -rf "$DEPS_PREFIX"
+              fi
+            fi
+            if [ ! -f "$pc1" ] && [ ! -f "$pc2" ]; then
+              tools/fetch-pinned-git.sh https://github.com/arancormonk/mbelib-neo "$want_sha" /tmp/mbelib-neo
+              cmake -S /tmp/mbelib-neo -B /tmp/mbelib-neo/build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_SHARED_LIBS=ON \
+                -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX"
+              cmake --build /tmp/mbelib-neo/build -j
+              cmake --install /tmp/mbelib-neo/build
+            fi
+            mkdir -p "$DEPS_PREFIX"
+            {
+              echo "mbe_sha=$want_sha"
+              echo "iwyu_sha=${{ steps.dep-shas.outputs.iwyu_sha }}"
+              echo "updated=$(date -u +%FT%TZ)"
+            } > "$mf"
+
+            rm -rf build/dev-debug
+            cmake --preset dev-debug
+
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              mapfile -t files < .ci/changed-files/analysis_tus.txt
+              ${{ matrix.run_cmd }} -- "${files[@]}"
+            else
+              ${{ matrix.run_cmd }}
+            fi
+
+            ccache -s
+          '
+
+      - name: Upload ${{ matrix.name }} output
+        if: always() && (github.event_name != 'pull_request' || steps.changed.outputs.analysis_tus != '0')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          include-hidden-files: true
+          retention-days: 7

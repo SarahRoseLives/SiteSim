@@ -1,0 +1,6 @@
+build/
+build-mingw/
+subscriber_test/subscriber_test
+*.o
+*.d
+imgui.ini

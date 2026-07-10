@@ -1,0 +1,391 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
+ */
+
+/**
+ * @file
+ * @brief SIMD FIR dispatch + scalar fallbacks + CPU detection.
+ *
+ * Implements runtime dispatch for FIR filter functions. Scalar implementations
+ * serve as reference and fallback. CPU detection selects best available SIMD.
+ */
+
+#include <atomic>
+#include <cstring>
+#include <dsd-neo/dsp/simd_fir.h>
+#include "dsd-neo/core/safe_api.h"
+#include "simd_x86_cpu.h"
+
+#if defined(__x86_64__) || defined(_M_X64)
+extern "C" void simd_fir_complex_apply_sse2(const float* in, int in_len, float* out, float* hist_i, float* hist_q,
+                                            const float* taps, int taps_len);
+extern "C" int simd_hb_decim2_complex_sse2(const float* in, int in_len, float* out, float* hist_i, float* hist_q,
+                                           const float* taps, int taps_len);
+extern "C" int simd_hb_decim2_real_sse2(const float* in, int in_len, float* out, float* hist, const float* taps,
+                                        int taps_len);
+#if defined(DSD_NEO_DSP_HAVE_AVX2_IMPL) && DSD_NEO_X86_AVX2_RUNTIME_PROBE_SUPPORTED
+extern "C" void simd_fir_complex_apply_avx2(const float* in, int in_len, float* out, float* hist_i, float* hist_q,
+                                            const float* taps, int taps_len);
+extern "C" int simd_hb_decim2_complex_avx2(const float* in, int in_len, float* out, float* hist_i, float* hist_q,
+                                           const float* taps, int taps_len);
+extern "C" int simd_hb_decim2_real_avx2(const float* in, int in_len, float* out, float* hist, const float* taps,
+                                        int taps_len);
+#endif
+#endif
+
+#if defined(__aarch64__) || defined(__arm64) || defined(_M_ARM64) || defined(_M_ARM64EC)
+extern "C" void simd_fir_complex_apply_neon(const float* in, int in_len, float* out, float* hist_i, float* hist_q,
+                                            const float* taps, int taps_len);
+extern "C" int simd_hb_decim2_complex_neon(const float* in, int in_len, float* out, float* hist_i, float* hist_q,
+                                           const float* taps, int taps_len);
+extern "C" int simd_hb_decim2_real_neon(const float* in, int in_len, float* out, float* hist, const float* taps,
+                                        int taps_len);
+#endif
+
+/* -------------------------------------------------------------------------- */
+/* Scalar Reference Implementations                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Scalar complex symmetric FIR filter (no decimation).
+ * Exploits tap symmetry: acc += tap[k] * (x[center-d] + x[center+d]).
+ */
+static void
+simd_fir_complex_apply_scalar(const float* in, int in_len, float* out, float* hist_i, float* hist_q, const float* taps,
+                              int taps_len) {
+    if (taps_len < 3 || (taps_len & 1) == 0 || in_len < 2) {
+        return;
+    }
+
+    const int N = in_len >> 1; /* complex samples */
+    const int hist_len = taps_len - 1;
+    const int center = (taps_len - 1) >> 1;
+
+    /* Get last sample for edge handling */
+    float lastI = in[(N - 1) << 1];
+    float lastQ = in[((N - 1) << 1) + 1];
+
+    /* Lambda to fetch sample from history or input */
+    auto get_iq = [&](int src_idx, float& xi, float& xq) {
+        if (src_idx < hist_len) {
+            xi = hist_i[src_idx];
+            xq = hist_q[src_idx];
+        } else {
+            int rel = src_idx - hist_len;
+            if (rel < N) {
+                xi = in[rel << 1];
+                xq = in[(rel << 1) + 1];
+            } else {
+                xi = lastI;
+                xq = lastQ;
+            }
+        }
+    };
+
+    for (int n = 0; n < N; n++) {
+        int center_idx = hist_len + n;
+        float accI = 0.0f;
+        float accQ = 0.0f;
+
+        /* Center tap */
+        float ci, cq;
+        get_iq(center_idx, ci, cq);
+        float cc = taps[center];
+        accI += cc * ci;
+        accQ += cc * cq;
+
+        /* Symmetric pairs */
+        for (int k = 0; k < center; k++) {
+            float ce = taps[k];
+            if (ce == 0.0f) {
+                continue;
+            }
+            int d = center - k;
+            float xmI, xmQ, xpI, xpQ;
+            get_iq(center_idx - d, xmI, xmQ);
+            get_iq(center_idx + d, xpI, xpQ);
+            accI += ce * (xmI + xpI);
+            accQ += ce * (xmQ + xpQ);
+        }
+
+        out[n << 1] = accI;
+        out[(n << 1) + 1] = accQ;
+    }
+
+    /* Update history with last (hist_len) complex samples */
+    if (N >= hist_len) {
+        for (int k = 0; k < hist_len; k++) {
+            int rel = N - hist_len + k;
+            hist_i[k] = in[rel << 1];
+            hist_q[k] = in[(rel << 1) + 1];
+        }
+    } else {
+        int need = hist_len - N;
+        DSD_MEMMOVE(hist_i, hist_i + (hist_len - need), (size_t)need * sizeof(float));
+        DSD_MEMMOVE(hist_q, hist_q + (hist_len - need), (size_t)need * sizeof(float));
+        for (int k = 0; k < N; k++) {
+            hist_i[need + k] = in[k << 1];
+            hist_q[need + k] = in[(k << 1) + 1];
+        }
+    }
+}
+
+/**
+ * Scalar complex half-band decimator by 2.
+ * Exploits zero-valued odd taps (except center) AND tap symmetry.
+ */
+static int
+simd_hb_decim2_complex_scalar(const float* in, int in_len, float* out, float* hist_i, float* hist_q, const float* taps,
+                              int taps_len) {
+    if (taps_len < 3 || (taps_len & 1) == 0) {
+        return 0;
+    }
+
+    int ch_len = in_len >> 1; /* per-channel samples */
+    if (ch_len <= 0) {
+        return 0;
+    }
+    int out_ch_len = ch_len >> 1; /* decimated per-channel */
+
+    const int center = (taps_len - 1) >> 1;
+    const int left_len = taps_len - 1;
+    float lastI = in[in_len - 2];
+    float lastQ = in[in_len - 1];
+
+    auto get_iq = [&](int src_idx, float& xi, float& xq) {
+        if (src_idx < left_len) {
+            xi = hist_i[src_idx];
+            xq = hist_q[src_idx];
+        } else {
+            int rel = src_idx - left_len;
+            if (rel < ch_len) {
+                xi = in[rel << 1];
+                xq = in[(rel << 1) + 1];
+            } else {
+                xi = lastI;
+                xq = lastQ;
+            }
+        }
+    };
+
+    for (int n = 0; n < out_ch_len; n++) {
+        int center_idx = (taps_len - 1) + (n << 1);
+        float accI = 0.0f;
+        float accQ = 0.0f;
+
+        /* Center tap */
+        float ci, cq;
+        get_iq(center_idx, ci, cq);
+        float cc = taps[center];
+        accI += cc * ci;
+        accQ += cc * cq;
+
+        /* Symmetric pairs: only even indices have non-zero taps in half-band */
+        for (int e = 0; e < center; e += 2) {
+            float ce = taps[e];
+            if (ce == 0.0f) {
+                continue;
+            }
+            int d = center - e;
+            float xmI, xmQ, xpI, xpQ;
+            get_iq(center_idx - d, xmI, xmQ);
+            get_iq(center_idx + d, xpI, xpQ);
+            accI += ce * (xmI + xpI);
+            accQ += ce * (xmQ + xpQ);
+        }
+
+        out[n << 1] = accI;
+        out[(n << 1) + 1] = accQ;
+    }
+
+    /* Update histories with last (taps_len-1) per-channel input samples */
+    if (ch_len >= left_len) {
+        int start = ch_len - left_len;
+        for (int k = 0; k < left_len; k++) {
+            int rel = start + k;
+            hist_i[k] = in[rel << 1];
+            hist_q[k] = in[(rel << 1) + 1];
+        }
+    } else {
+        int keep = left_len - ch_len;
+        DSD_MEMMOVE(hist_i, hist_i + ch_len, (size_t)keep * sizeof(float));
+        DSD_MEMMOVE(hist_q, hist_q + ch_len, (size_t)keep * sizeof(float));
+        for (int k = 0; k < ch_len; k++) {
+            hist_i[keep + k] = in[k << 1];
+            hist_q[keep + k] = in[(k << 1) + 1];
+        }
+    }
+
+    return out_ch_len << 1;
+}
+
+/**
+ * Scalar real half-band decimator by 2.
+ * Exploits zero-valued odd taps (except center) AND tap symmetry.
+ */
+static int
+simd_hb_decim2_real_scalar(const float* in, int in_len, float* out, float* hist, const float* taps, int taps_len) {
+    if (taps_len < 3 || (taps_len & 1) == 0) {
+        return 0;
+    }
+    if (in_len <= 0) {
+        return 0;
+    }
+
+    const int hist_len = taps_len - 1;
+    const int center = (taps_len - 1) >> 1;
+    int out_len = in_len >> 1;
+
+    float last = in[in_len - 1];
+
+    auto get_sample = [&](int src_idx) -> float {
+        if (src_idx < hist_len) {
+            return hist[src_idx];
+        } else {
+            int rel = src_idx - hist_len;
+            return (rel < in_len) ? in[rel] : last;
+        }
+    };
+
+    for (int n = 0; n < out_len; n++) {
+        int center_idx = hist_len + (n << 1);
+        float acc = 0.0f;
+
+        /* Center tap */
+        acc += taps[center] * get_sample(center_idx);
+
+        /* Symmetric pairs: only even indices have non-zero taps */
+        for (int e = 0; e < center; e += 2) {
+            float ce = taps[e];
+            if (ce == 0.0f) {
+                continue;
+            }
+            int d = center - e;
+            float xm = get_sample(center_idx - d);
+            float xp = get_sample(center_idx + d);
+            acc += ce * (xm + xp);
+        }
+
+        out[n] = acc;
+    }
+
+    /* Update history */
+    if (in_len >= hist_len) {
+        DSD_MEMCPY(hist, in + (in_len - hist_len), (size_t)hist_len * sizeof(float));
+    } else {
+        int need = hist_len - in_len;
+        DSD_MEMMOVE(hist, hist + in_len, (size_t)need * sizeof(float));
+        DSD_MEMCPY(hist + need, in, (size_t)in_len * sizeof(float));
+    }
+
+    return out_len;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Function Pointer Dispatch                                                  */
+/* -------------------------------------------------------------------------- */
+
+using fir_complex_fn = void (*)(const float*, int, float*, float*, float*, const float*, int);
+using hb_decim2_complex_fn = int (*)(const float*, int, float*, float*, float*, const float*, int);
+using hb_decim2_real_fn = int (*)(const float*, int, float*, float*, const float*, int);
+
+static fir_complex_fn g_fir_complex_impl = simd_fir_complex_apply_scalar;
+static hb_decim2_complex_fn g_hb_decim2_complex_impl = simd_hb_decim2_complex_scalar;
+static hb_decim2_real_fn g_hb_decim2_real_impl = simd_hb_decim2_real_scalar;
+static const char* g_impl_name = "scalar";
+
+/* Dispatch init state: 0 = not started, 1 = in progress, 2 = done */
+static std::atomic<int> g_fir_init_done{0};
+
+static inline bool
+simd_fir_prefer_scalar_for_block(int in_len, int taps_len) {
+    return in_len > 0 && taps_len > 0 && in_len < taps_len * 2;
+}
+
+static void
+simd_fir_init_dispatch() {
+    int expected = 0;
+    if (!g_fir_init_done.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+        /* Another thread is initializing; spin until done */
+        while (g_fir_init_done.load(std::memory_order_acquire) != 2) {
+            /* spin */
+        }
+        return;
+    }
+
+    /* Perform one-time initialization */
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(DSD_NEO_DSP_HAVE_AVX2_IMPL) && DSD_NEO_X86_AVX2_RUNTIME_PROBE_SUPPORTED
+    if (dsd_neo_cpu_has_avx2_with_os_support()) {
+        g_fir_complex_impl = simd_fir_complex_apply_avx2;
+        g_hb_decim2_complex_impl = simd_hb_decim2_complex_avx2;
+        g_hb_decim2_real_impl = simd_hb_decim2_real_avx2;
+        g_impl_name = "avx2";
+    } else
+#endif
+    {
+        g_fir_complex_impl = simd_fir_complex_apply_sse2;
+        g_hb_decim2_complex_impl = simd_hb_decim2_complex_sse2;
+        g_hb_decim2_real_impl = simd_hb_decim2_real_sse2;
+        g_impl_name = "sse2";
+    }
+#elif defined(__aarch64__) || defined(__arm64) || defined(_M_ARM64) || defined(_M_ARM64EC)
+    g_fir_complex_impl = simd_fir_complex_apply_neon;
+    g_hb_decim2_complex_impl = simd_hb_decim2_complex_neon;
+    g_hb_decim2_real_impl = simd_hb_decim2_real_neon;
+    g_impl_name = "neon";
+#else
+    /* Already set to scalar */
+#endif
+
+    g_fir_init_done.store(2, std::memory_order_release);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Public API                                                                 */
+/* -------------------------------------------------------------------------- */
+
+extern "C" void
+simd_fir_complex_apply(const float* in, int in_len, float* out, float* hist_i, float* hist_q, const float* taps,
+                       int taps_len) {
+    if (simd_fir_prefer_scalar_for_block(in_len, taps_len)) {
+        simd_fir_complex_apply_scalar(in, in_len, out, hist_i, hist_q, taps, taps_len);
+        return;
+    }
+    if (g_fir_init_done.load(std::memory_order_acquire) != 2) {
+        simd_fir_init_dispatch();
+    }
+    g_fir_complex_impl(in, in_len, out, hist_i, hist_q, taps, taps_len);
+}
+
+extern "C" int
+simd_hb_decim2_complex(const float* in, int in_len, float* out, float* hist_i, float* hist_q, const float* taps,
+                       int taps_len) {
+    if (simd_fir_prefer_scalar_for_block(in_len, taps_len)) {
+        return simd_hb_decim2_complex_scalar(in, in_len, out, hist_i, hist_q, taps, taps_len);
+    }
+    if (g_fir_init_done.load(std::memory_order_acquire) != 2) {
+        simd_fir_init_dispatch();
+    }
+    return g_hb_decim2_complex_impl(in, in_len, out, hist_i, hist_q, taps, taps_len);
+}
+
+extern "C" int
+simd_hb_decim2_real(const float* in, int in_len, float* out, float* hist, const float* taps, int taps_len) {
+    if (simd_fir_prefer_scalar_for_block(in_len, taps_len)) {
+        return simd_hb_decim2_real_scalar(in, in_len, out, hist, taps, taps_len);
+    }
+    if (g_fir_init_done.load(std::memory_order_acquire) != 2) {
+        simd_fir_init_dispatch();
+    }
+    return g_hb_decim2_real_impl(in, in_len, out, hist, taps, taps_len);
+}
+
+extern "C" const char*
+simd_fir_get_impl_name(void) {
+    if (g_fir_init_done.load(std::memory_order_acquire) != 2) {
+        simd_fir_init_dispatch();
+    }
+    return g_impl_name;
+}

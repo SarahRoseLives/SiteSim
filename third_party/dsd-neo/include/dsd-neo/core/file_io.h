@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
+ */
+
+/**
+ * @file
+ * @brief Core file I/O helpers used by CLI/UI orchestration.
+ *
+ * Declares file-related helpers implemented in core.
+ */
+
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_CORE_FILE_IO_H_H
+#define DSD_NEO_INCLUDE_DSD_NEO_CORE_FILE_IO_H_H
+
+#include <dsd-neo/core/opts_fwd.h>
+#include <dsd-neo/core/state.h>
+#include <dsd-neo/core/state_fwd.h>
+#include <dsd-neo/platform/platform.h>
+#include <dsd-neo/platform/sndfile_fwd.h>
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void saveImbe4400Data(dsd_opts* opts, const dsd_state* state, const char* imbe_d);
+void saveAmbe2450Data(dsd_opts* opts, const dsd_state* state, const char* ambe_d);
+void saveAmbe2450DataR(dsd_opts* opts, const dsd_state* state, const char* ambe_d);
+int dsd_frame_log_enabled(const dsd_opts* opts);
+int dsd_frame_detail_enabled(const dsd_opts* opts);
+void dsd_frame_logf(dsd_opts* opts, const char* format, ...) DSD_ATTR_FORMAT(printf, 2, 3);
+void dsd_frame_log_close(dsd_opts* opts);
+int dsd_p25_sm_log_enabled(const dsd_opts* opts);
+void dsd_p25_sm_logf(dsd_opts* opts, const char* format, ...) DSD_ATTR_FORMAT(printf, 2, 3);
+void dsd_p25_sm_log_close(dsd_opts* opts);
+void PrintAMBEData(dsd_opts* opts, const dsd_state* state, const char* ambe_d);
+void PrintIMBEData(dsd_opts* opts, const dsd_state* state, const char* imbe_d);
+int readImbe4400Data(dsd_opts* opts, dsd_state* state, char* imbe_d);
+int readAmbe2450Data(dsd_opts* opts, dsd_state* state, char* ambe_d);
+void read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state);
+void openMbeInFile(dsd_opts* opts, dsd_state* state);
+void openMbeOutFile(dsd_opts* opts, dsd_state* state);
+void openMbeOutFileR(dsd_opts* opts, dsd_state* state);
+void openWavOutFileLR(dsd_opts* opts, dsd_state* state);
+SNDFILE* open_wav_file(char* dir, char* temp_filename, size_t temp_filename_size, uint16_t sample_rate, uint8_t ext);
+void openWavOutFileRaw(dsd_opts* opts, dsd_state* state);
+void openSymbolOutFile(dsd_opts* opts, dsd_state* state);
+SNDFILE* close_wav_file(SNDFILE* wav_file);
+SNDFILE* close_and_rename_wav_file(SNDFILE* wav_file, const dsd_opts* opts, const char* wav_out_filename,
+                                   const char* dir, const Event_History_I* event_struct);
+void closeMbeOutFile(dsd_opts* opts, dsd_state* state);
+void closeMbeOutFileR(dsd_opts* opts, dsd_state* state);
+void closeSymbolOutFile(dsd_opts* opts, dsd_state* state);
+void rotate_symbol_out_file(dsd_opts* opts, dsd_state* state);
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_CORE_FILE_IO_H_H */

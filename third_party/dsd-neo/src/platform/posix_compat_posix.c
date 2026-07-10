@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
+ */
+
+/* Ensure BSD/Darwin extensions (mkdtemp) are declared on macOS. */
+#if defined(__APPLE__) && defined(__MACH__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
+
+#include <dsd-neo/platform/posix_compat.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include "dsd-neo/platform/platform.h"
+
+#if !DSD_PLATFORM_WIN_NATIVE
+
+#if defined(__APPLE__) && defined(__MACH__)
+/*
+ * Some Apple SDK feature-level combinations still hide mkdtemp from stdlib.h.
+ * Provide the prototype explicitly so strict C99+ builds do not fail with an
+ * implicit declaration.
+ */
+extern char* mkdtemp(char* tmpl);
+#endif
+
+int
+dsd_setenv(const char* name, const char* value, int overwrite) {
+    return setenv(name, value, overwrite);
+}
+
+int
+dsd_unsetenv(const char* name) {
+    return unsetenv(name);
+}
+
+int
+dsd_mkdir(const char* path, int mode) {
+    return mkdir(path, (mode_t)mode);
+}
+
+int
+dsd_open_serial_write(const char* path) {
+    if (!path || path[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    return open(path, O_WRONLY | O_NOCTTY);
+}
+
+void*
+dsd_aligned_alloc(size_t alignment, size_t size) {
+    void* ptr = NULL;
+    if (posix_memalign(&ptr, alignment, size) != 0) {
+        ptr = NULL;
+    }
+    return ptr;
+}
+
+void
+dsd_aligned_free(void* ptr) {
+    free(ptr);
+}
+
+int
+dsd_mkstemp(char* tmpl) {
+    return mkstemp(tmpl);
+}
+
+char*
+dsd_mkdtemp(char* tmpl) {
+    return mkdtemp(tmpl);
+}
+
+#endif /* !DSD_PLATFORM_WIN_NATIVE */

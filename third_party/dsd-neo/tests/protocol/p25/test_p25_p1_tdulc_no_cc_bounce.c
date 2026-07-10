@@ -1,0 +1,301 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
+ */
+
+/*
+ * Regression: P25p1 TDULC must not force an immediate return to the control channel.
+ *
+ * Some systems use TDULC to carry mid-call link control updates (e.g., LCW 0x44).
+ * Returning to CC on every TDULC causes VC bouncing and missed audio.
+ *
+ * This test:
+ *  - Puts the unified P25 trunk SM into TUNED via a synthetic group grant
+ *  - Invokes processTDULC() while forcing TDULC FEC failure (no LCW dispatch)
+ *  - Asserts that return_to_cc() is not called (i.e., no immediate CC bounce)
+ */
+
+#include <dsd-neo/core/dibit.h>
+#include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/state.h>
+#include <dsd-neo/protocol/p25/p25_trunk_sm.h>
+#include <dsd-neo/protocol/p25/p25p1_soft.h>
+#include <dsd-neo/runtime/trunk_tuning_hooks.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/safe_api.h"
+#include "dsd-neo/core/state_fwd.h"
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-prototypes"
+#endif
+
+struct RtlSdrContext;
+
+void processTDULC(dsd_opts* opts, dsd_state* state);
+
+// Strong stubs for I/O hooks to keep tests hermetic
+bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+SetFreq(int sockfd, long int freq) {
+    (void)sockfd;
+    (void)freq;
+    return true;
+}
+
+bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+SetModulation(int sockfd, int bandwidth) {
+    (void)sockfd;
+    (void)bandwidth;
+    return true;
+}
+
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+struct RtlSdrContext* g_rtl_ctx = 0;
+
+int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+rtl_stream_tune(struct RtlSdrContext* ctx, uint32_t center_freq_hz) {
+    (void)ctx;
+    (void)center_freq_hz;
+    return 0;
+}
+
+static int g_return_to_cc_called = 0;
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+return_to_cc(dsd_opts* opts, dsd_state* state) {
+    g_return_to_cc_called++;
+    if (opts) {
+        opts->p25_is_tuned = 0;
+        opts->trunk_is_tuned = 0;
+    }
+    if (state) {
+        state->p25_vc_freq[0] = state->p25_vc_freq[1] = 0;
+        state->trunk_vc_freq[0] = state->trunk_vc_freq[1] = 0;
+    }
+}
+
+static void
+install_trunk_tuning_hooks(void) {
+    dsd_trunk_tuning_hooks hooks = {0};
+    hooks.return_to_cc = return_to_cc;
+    dsd_trunk_tuning_hooks_set(hooks);
+}
+
+// Minimal utility used by TDULC path (MSB-first)
+uint64_t
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+ConvertBitIntoBytes(const uint8_t* BufferIn, uint32_t BitLength) {
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < BitLength; i++) {
+        v = (v << 1) | (uint64_t)(BufferIn[i] & 1);
+    }
+    return v;
+}
+
+// LCW path external helpers (not exercised by this test; provide no-op stubs for link)
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+apx_embedded_alias_header_phase1(dsd_opts* opts, dsd_state* state, uint8_t slot, uint8_t* lc_bits) {
+    (void)opts;
+    (void)state;
+    (void)slot;
+    (void)lc_bits;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+apx_embedded_alias_blocks_phase1(dsd_opts* opts, dsd_state* state, uint8_t slot, uint8_t* lc_bits) {
+    (void)opts;
+    (void)state;
+    (void)slot;
+    (void)lc_bits;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+l3h_embedded_alias_blocks_phase1(dsd_opts* opts, dsd_state* state, uint8_t slot, uint8_t* lc_bits) {
+    (void)opts;
+    (void)state;
+    (void)slot;
+    (void)lc_bits;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+apx_embedded_gps(dsd_opts* opts, dsd_state* state, uint8_t* lc_bits) {
+    (void)opts;
+    (void)state;
+    (void)lc_bits;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+nmea_harris(dsd_opts* opts, dsd_state* state, uint8_t* input, uint32_t src, int slot) {
+    (void)opts;
+    (void)state;
+    (void)input;
+    (void)src;
+    (void)slot;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+tait_iso7_embedded_alias_decode(dsd_opts* opts, dsd_state* state, uint8_t slot, int16_t len, uint8_t* input) {
+    (void)opts;
+    (void)state;
+    (void)slot;
+    (void)len;
+    (void)input;
+}
+
+// FEC stubs: force Reed-Solomon failure so processTDULC does not dispatch LCW
+int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+check_and_fix_golay_24_12(char* dodeca, char* parity, int* fixed_errors) {
+    (void)dodeca;
+    (void)parity;
+    if (fixed_errors) {
+        *fixed_errors = 0;
+    }
+    return 0;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+encode_golay_24_12(char* data, char* parity) {
+    (void)data;
+    (void)parity;
+}
+
+int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+check_and_fix_reedsolomon_24_12_13(char* data, char* parity) {
+    (void)data;
+    (void)parity;
+    return 1; // irrecoverable
+}
+
+int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+check_and_fix_reedsolomon_24_12_13_soft(char* data, char* parity, const int* erasures, int n_erasures) {
+    (void)data;
+    (void)parity;
+    (void)erasures;
+    (void)n_erasures;
+    return 1;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+encode_reedsolomon_24_12_13(char* data, char* parity) {
+    (void)data;
+    (void)parity;
+}
+
+int
+getDibit(dsd_opts* opts, dsd_state* state) {
+    (void)opts;
+    (void)state;
+    return 0;
+}
+
+int
+getDibitSoft(dsd_opts* opts, dsd_state* state, dsd_dibit_soft_t* out_soft) {
+    (void)opts;
+    (void)state;
+    if (out_soft) {
+        out_soft->reliability = 255;
+        out_soft->llr[0] = -255;
+        out_soft->llr[1] = -255;
+    }
+    return 0;
+}
+
+// TDULC word reader stubs (all zeros)
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+read_word(dsd_opts* opts, dsd_state* state, char* word, unsigned int length, int* status_count,
+          P25P1SoftDibit* soft_dibits, int* soft_dibit_index) {
+    (void)opts;
+    (void)state;
+    (void)status_count;
+    (void)soft_dibits;
+    (void)soft_dibit_index;
+    DSD_MEMSET(word, 0, length);
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+read_golay24_parity(dsd_opts* opts, dsd_state* state, char* parity, int* status_count, P25P1SoftDibit* soft_dibits,
+                    int* soft_dibit_index) {
+    (void)opts;
+    (void)state;
+    (void)status_count;
+    (void)soft_dibits;
+    (void)soft_dibit_index;
+    DSD_MEMSET(parity, 0, 12);
+}
+
+static int
+expect_eq_int(const char* tag, int got, int want) {
+    if (got != want) {
+        DSD_FPRINTF(stderr, "%s: got %d want %d\n", tag, got, want);
+        return 1;
+    }
+    return 0;
+}
+
+int
+main(void) {
+    int rc = 0;
+
+    static dsd_opts opts;
+    static dsd_state state;
+    install_trunk_tuning_hooks();
+    DSD_MEMSET(&opts, 0, sizeof opts);
+    DSD_MEMSET(&state, 0, sizeof state);
+
+    // Enable trunking and allow group-call tuning
+    opts.p25_trunk = 1;
+    opts.trunk_tune_group_calls = 1;
+    opts.trunk_tune_enc_calls = 1;
+    opts.verbose = 0;
+
+    // Seed a known CC to allow the SM to initialize in ON_CC
+    state.p25_cc_freq = 851000000;
+
+    // Minimal IDEN mapping so the synthetic grant produces a non-zero VC frequency
+    int iden = 1;
+    // Populate new dual-array
+    state.p25_iden_fdma[iden].base_freq = 851000000L / 5L;
+    state.p25_iden_fdma[iden].chan_type = 1;
+    state.p25_iden_fdma[iden].chan_spac = 100;
+    state.p25_iden_fdma[iden].populated = 1;
+    state.p25_iden_fdma[iden].trust = 2;
+    state.p25_chan_tdma_explicit[iden] = 1; // FDMA known
+
+    // Initialize SM and tune to a VC via a group grant
+    p25_sm_init(&opts, &state);
+    int channel = (iden << 12) | 0x000A;
+    p25_sm_on_group_grant(&opts, &state, channel, /*svc*/ 0, /*tg*/ 1234, /*src*/ 5678);
+    rc |= expect_eq_int("tuned after grant", opts.p25_is_tuned, 1);
+
+    // TDULC should not immediately bounce back to CC
+    g_return_to_cc_called = 0;
+    processTDULC(&opts, &state);
+    rc |= expect_eq_int("return_to_cc not called", g_return_to_cc_called, 0);
+    rc |= expect_eq_int("still tuned after TDULC", opts.p25_is_tuned, 1);
+
+    return rc;
+}
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic pop
+#endif

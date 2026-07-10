@@ -1,0 +1,454 @@
+name: windows-ci
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+    tags:
+      - "v*.*.*"
+    paths-ignore:
+      - ".*"
+      - "**/*.md"
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-native-msvc:
+    runs-on: windows-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    env:
+      # Use a release-only triplet to avoid building debug variants of vcpkg deps.
+      VCPKG_DEFAULT_TRIPLET: x64-windows-dynamic-release
+      VCPKG_TARGET_TRIPLET: x64-windows-dynamic-release
+      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}\vcpkg-triplets
+      # Pull requests may restore existing vcpkg binaries but must not write new cache entries.
+      VCPKG_EXE: ${{ github.workspace }}/vcpkg/vcpkg.exe
+      VCPKG_NUGET_FEED: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
+      VCPKG_NUGET_USER: ${{ github.repository_owner }}
+      VCPKG_BINARY_SOURCES: "clear;nuget,https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json,read"
+      # Enable sccache GitHub Actions backend.
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
+
+      - name: Initialize sccache
+        shell: pwsh
+        run: |
+          & $env:SCCACHE_PATH --version
+          & $env:SCCACHE_PATH --zero-stats
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
+        with:
+          # run-vcpkg v11.5 requires a full 40-char SHA1.
+          # Keep this in sync with vcpkg.json's builtin-baseline.
+          vcpkgGitCommitId: "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3"
+
+      - name: Configure vcpkg binary cache
+        shell: pwsh
+        env:
+          VCPKG_NUGET_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $nuget = (& $env:VCPKG_EXE fetch nuget | Select-Object -Last 1)
+          if (-not $nuget) { throw "vcpkg fetch nuget did not return a path" }
+
+          & $nuget sources add `
+            -Source "$env:VCPKG_NUGET_FEED" `
+            -StorePasswordInClearText `
+            -Name GitHubPackages `
+            -UserName "$env:VCPKG_NUGET_USER" `
+            -Password "$env:VCPKG_NUGET_TOKEN" `
+            -NonInteractive
+
+      - name: Install vcpkg dependencies (MSVC)
+        shell: pwsh
+        run: >-
+          vcpkg install
+          --triplet $env:VCPKG_DEFAULT_TRIPLET
+          --overlay-triplets "$env:GITHUB_WORKSPACE\\vcpkg-triplets"
+          --x-manifest-root "$env:GITHUB_WORKSPACE"
+
+      - name: Configure (MSVC Release)
+        shell: pwsh
+        # Use Ninja generator (override preset) so CMAKE_*_COMPILER_LAUNCHER works with sccache
+        run: |
+          cmake --preset win-msvc-release -G Ninja `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            -DDSD_REQUIRE_RTLSDR=ON `
+            -DDSD_REQUIRE_SOAPYSDR=ON
+
+      - name: Build (MSVC Release)
+        shell: pwsh
+        run: cmake --build --preset win-msvc-release
+
+      - name: Verify release hardening (MSVC)
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path 'build/win-msvc-release/apps/dsd-cli' -Recurse -Filter 'dsd-neo.exe' |
+            Select-Object -First 1
+          if ($null -eq $exe) { throw "dsd-neo.exe not found under build/win-msvc-release/apps/dsd-cli" }
+          ./tools/check_release_hardening.ps1 $exe.FullName
+
+      - name: Show sccache stats
+        shell: pwsh
+        run: |
+          & $env:SCCACHE_PATH --show-stats
+
+  package-native-msvc:
+    name: Package native MSVC ZIP
+    runs-on: windows-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      actions: read
+      attestations: write
+      artifact-metadata: write
+      contents: read
+      id-token: write
+      packages: write
+    env:
+      # Use a release-only triplet to avoid building debug variants of vcpkg deps.
+      VCPKG_DEFAULT_TRIPLET: x64-windows-dynamic-release
+      VCPKG_TARGET_TRIPLET: x64-windows-dynamic-release
+      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}\vcpkg-triplets
+      # vcpkg removed the GitHub Actions binary cache backend; use GitHub Packages via NuGet.
+      VCPKG_EXE: ${{ github.workspace }}/vcpkg/vcpkg.exe
+      VCPKG_NUGET_FEED: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
+      VCPKG_NUGET_USER: ${{ github.repository_owner }}
+      VCPKG_BINARY_SOURCES: "clear;nuget,https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json,readwrite"
+      # Enable sccache GitHub Actions backend.
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: release
+        shell: bash
+        env:
+          RELEASE_TAG_CREATED: ${{ github.event.created }}
+        run: tools/ci_validate_release_tag.sh
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
+
+      - name: Initialize sccache
+        shell: pwsh
+        run: |
+          & $env:SCCACHE_PATH --version
+          & $env:SCCACHE_PATH --zero-stats
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
+        with:
+          # run-vcpkg v11.5 requires a full 40-char SHA1.
+          # Keep this in sync with vcpkg.json's builtin-baseline.
+          vcpkgGitCommitId: "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3"
+
+      - name: Configure vcpkg binary cache
+        shell: pwsh
+        env:
+          VCPKG_NUGET_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $nuget = (& $env:VCPKG_EXE fetch nuget | Select-Object -Last 1)
+          if (-not $nuget) { throw "vcpkg fetch nuget did not return a path" }
+
+          & $nuget sources add `
+            -Source "$env:VCPKG_NUGET_FEED" `
+            -StorePasswordInClearText `
+            -Name GitHubPackages `
+            -UserName "$env:VCPKG_NUGET_USER" `
+            -Password "$env:VCPKG_NUGET_TOKEN" `
+            -NonInteractive
+
+          & $nuget setapikey "$env:VCPKG_NUGET_TOKEN" `
+            -Source "$env:VCPKG_NUGET_FEED" `
+            -NonInteractive
+
+      - name: Install vcpkg dependencies (MSVC)
+        shell: pwsh
+        run: vcpkg install --triplet $env:VCPKG_DEFAULT_TRIPLET --overlay-triplets "$env:GITHUB_WORKSPACE\\vcpkg-triplets" --x-manifest-root "$env:GITHUB_WORKSPACE"
+
+      - name: Configure (MSVC Release)
+        shell: pwsh
+        # Use Ninja generator (override preset) so CMAKE_*_COMPILER_LAUNCHER works with sccache
+        run: |
+          cmake --preset win-msvc-release -G Ninja `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            -DDSD_REQUIRE_RTLSDR=ON `
+            -DDSD_REQUIRE_SOAPYSDR=ON
+
+      - name: Build (MSVC Release)
+        shell: pwsh
+        run: cmake --build --preset win-msvc-release
+
+      - name: Verify built release hardening (MSVC)
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path 'build/win-msvc-release/apps/dsd-cli' -Recurse -Filter 'dsd-neo.exe' |
+            Select-Object -First 1
+          if ($null -eq $exe) { throw "dsd-neo.exe not found under build/win-msvc-release/apps/dsd-cli" }
+          ./tools/check_release_hardening.ps1 $exe.FullName
+
+      - name: Show sccache stats
+        shell: pwsh
+        run: |
+          & $env:SCCACHE_PATH --show-stats
+
+      - name: Stage native MSVC tree
+        if: github.event_name != 'pull_request'
+        id: stage
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path 'build/win-msvc-release/apps/dsd-cli' -Recurse -Filter 'dsd-neo.exe' |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) { throw "Exe not found under build/win-msvc-release/apps/dsd-cli" }
+          $stage = 'dist/dsd-neo-msvc'
+          $binDir = Join-Path $stage 'bin'
+          $docDir = Join-Path $stage 'share/doc/dsd-neo'
+          $licenseDir = Join-Path $docDir 'licenses'
+          New-Item -ItemType Directory -Force -Path $binDir,$docDir,$licenseDir | Out-Null
+          Copy-Item -Force $exe $binDir
+
+          $triplet = $env:VCPKG_TARGET_TRIPLET
+          if (-not $triplet) { $triplet = $env:VCPKG_DEFAULT_TRIPLET }
+          if (-not $triplet) { $triplet = 'x64-windows-dynamic-release' }
+          $vcpkgBin = Join-Path $env:GITHUB_WORKSPACE (Join-Path 'vcpkg_installed' (Join-Path $triplet 'bin'))
+          $searchDirs = @()
+          if (Test-Path $vcpkgBin) { $searchDirs += $vcpkgBin }
+          & 'tools/windows/stage_runtime_dlls.ps1' `
+            -TargetBinary (Join-Path $binDir 'dsd-neo.exe') `
+            -DestinationDir $binDir `
+            -SearchDirs $searchDirs
+
+          Copy-Item -Force LICENSE,COPYRIGHT,THIRD_PARTY.md $docDir -ErrorAction SilentlyContinue
+          Copy-Item -Force 'src/third_party/ezpwd/lesser.txt' (Join-Path $licenseDir 'ezpwd-LGPL-2.1-or-later.txt') -ErrorAction SilentlyContinue
+          Copy-Item -Force 'src/third_party/pffft/COPYING' (Join-Path $licenseDir 'pffft-FFTPACK.txt') -ErrorAction SilentlyContinue
+          $required = @('LICENSE','COPYRIGHT','THIRD_PARTY.md','licenses/ezpwd-LGPL-2.1-or-later.txt','licenses/pffft-FFTPACK.txt')
+          foreach ($f in $required) {
+            $p = Join-Path $docDir $f
+            if (!(Test-Path $p)) { throw "Missing required license file in staged docs: $p" }
+          }
+
+      - name: Verify staged release hardening (MSVC)
+        shell: pwsh
+        run: |
+          $bin = 'dist/dsd-neo-msvc/bin'
+          if (!(Test-Path $bin)) { throw "Staged bin directory not found: $bin" }
+          $artifacts = @(Get-ChildItem -Path $bin -File | Where-Object { $_.Extension -in @('.exe', '.dll') })
+          if ($artifacts.Count -eq 0) { throw "No staged PE artifacts found under $bin" }
+          foreach ($artifact in $artifacts) {
+            ./tools/check_release_hardening.ps1 $artifact.FullName
+          }
+
+      - name: Smoke test staged binary (MSVC)
+        shell: pwsh
+        run: |
+          $exe = 'dist/dsd-neo-msvc/bin/dsd-neo.exe'
+          if (!(Test-Path $exe)) { throw "Staged exe not found: $exe" }
+          $bin = Split-Path -Parent $exe
+          # Ensure the staged tree is self-contained by avoiding PATH leakage
+          # from the build environment (vcpkg/VS).
+          $env:PATH = "$bin;$env:SystemRoot\\System32;$env:SystemRoot"
+          Write-Host "Running: $exe -h"
+          & $exe -h
+
+      - name: Archive native MSVC ZIP
+        shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $stage = 'dist/dsd-neo-msvc'
+          if ($env:REF_TYPE -eq 'tag' -and $env:REF_NAME) {
+            $zip = "dist/dsd-neo-msvc-x86_64-native-$($env:REF_NAME).zip"
+            $artName = "dsd-neo-msvc-x86_64-native-$($env:REF_NAME)"
+          } else {
+            $zip = "dist/dsd-neo-msvc-x86_64-native-nightly.zip"
+            $artName = "dsd-neo-msvc-x86_64-native-nightly"
+          }
+          if (Test-Path $zip) { Remove-Item -Force $zip }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip)
+          echo "ZIP_PATH=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          echo "ART_NAME=$artName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        id: zip
+
+      - name: Verify ZIP contents (extract and run help)
+        shell: pwsh
+        run: |
+          $zip = '${{ steps.zip.outputs.ZIP_PATH }}'
+          if (!(Test-Path $zip)) { throw "ZIP not found: $zip" }
+          $dest = Join-Path $env:RUNNER_TEMP ('dsd-neo-msvc-' + [System.Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $dest)
+          $bin = Join-Path $dest 'bin'
+          $exe = Join-Path $bin 'dsd-neo.exe'
+          if (!(Test-Path $exe)) { throw "Extracted exe not found: $exe" }
+          # Ensure the ZIP is self-contained by avoiding PATH leakage from the
+          # build environment.
+          $env:PATH = "$bin;$env:SystemRoot\\System32;$env:SystemRoot"
+          Write-Host "Running: $exe -h"
+          & $exe -h
+
+      - name: Upload native MSVC artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.zip.outputs.ART_NAME }}
+          path: ${{ steps.zip.outputs.ZIP_PATH }}
+          retention-days: 7
+
+      - name: Generate native MSVC SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          file: ${{ steps.zip.outputs.ZIP_PATH }}
+          format: spdx-json
+          output-file: ${{ steps.zip.outputs.ZIP_PATH }}.spdx.json
+          artifact-name: ${{ steps.zip.outputs.ART_NAME }}.spdx.json
+          upload-artifact: true
+          upload-release-assets: false
+
+      - name: Attest native MSVC provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: ${{ steps.zip.outputs.ZIP_PATH }}
+
+      - name: Attest native MSVC SBOM
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: ${{ steps.zip.outputs.ZIP_PATH }}
+          sbom-path: ${{ steps.zip.outputs.ZIP_PATH }}.spdx.json
+
+  publish-native-msvc:
+    name: Publish native MSVC ZIP
+    needs: package-native-msvc
+    runs-on: ubuntu-latest
+    if: >-
+      github.repository == 'arancormonk/dsd-neo' &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+      ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')))
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Checkout release helpers
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prepare artifact naming
+        id: names
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" = 'tag' ] && [ -n "$REF_NAME" ]; then
+            zip="dist/dsd-neo-msvc-x86_64-native-${REF_NAME}.zip"
+            artName="dsd-neo-msvc-x86_64-native-${REF_NAME}"
+            title="dsd-neo ${REF_NAME#v}"
+          else
+            zip="dist/dsd-neo-msvc-x86_64-native-nightly.zip"
+            artName="dsd-neo-msvc-x86_64-native-nightly"
+            title="nightly"
+          fi
+          mkdir -p dist
+          {
+            echo "ZIP_PATH=$zip"
+            echo "ART_NAME=$artName"
+            echo "RELEASE_TITLE=$title"
+          } >> "$GITHUB_OUTPUT"
+      - name: Download package artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ steps.names.outputs.ART_NAME }}
+          path: dist
+      - name: Download package SBOM artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ steps.names.outputs.ART_NAME }}.spdx.json
+          path: dist
+      - name: Normalize downloaded SBOM filename
+        shell: bash
+        run: |
+          set -euo pipefail
+          mv -f "dist/${{ steps.names.outputs.ART_NAME }}.spdx.json" "${{ steps.names.outputs.ZIP_PATH }}.spdx.json"
+      - name: Verify downloaded release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "${{ steps.names.outputs.ZIP_PATH }}"
+          test -f "${{ steps.names.outputs.ZIP_PATH }}.spdx.json"
+      - name: Wait for release metadata
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: tools/ci_wait_for_release.sh
+      - name: Upload native MSVC release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          ZIP_PATH: ${{ steps.names.outputs.ZIP_PATH }}
+          SBOM_PATH: ${{ steps.names.outputs.ZIP_PATH }}.spdx.json
+        run: |
+          set -euo pipefail
+          gh release upload "${RELEASE_TAG}" \
+            "${ZIP_PATH}" \
+            "${SBOM_PATH}" \
+            --repo "${RELEASE_REPOSITORY}" \
+            --clobber
+      - name: Upload native MSVC nightly assets (overwrite)
+        if: >-
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b
+        with:
+          tag_name: nightly
+          name: nightly
+          prerelease: true
+          make_latest: false
+          target_commitish: ${{ github.sha }}
+          files: |
+            ${{ steps.names.outputs.ZIP_PATH }}
+            ${{ steps.names.outputs.ZIP_PATH }}.spdx.json
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          token: ${{ github.token }}

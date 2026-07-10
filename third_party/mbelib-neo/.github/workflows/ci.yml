@@ -1,0 +1,934 @@
+name: CI
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+    tags:
+      - "v*.*.*"
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    needs: [format-check, clang-tidy, cppcheck, lizard, scan-build, semgrep]
+    name: ${{ matrix.os }} • preset=${{ matrix.preset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        preset: [dev-debug, dev-release, notones-debug]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Configure (${{ matrix.preset }})
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build (${{ matrix.preset }})
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+      - name: Test (${{ matrix.preset }})
+        run: ctest --preset ${{ matrix.preset }} -V
+      - name: Verify release hardening (Unix)
+        if: matrix.os != 'windows-latest' && matrix.preset == 'dev-release'
+        run: |
+          case "${RUNNER_OS}" in
+            Linux) lib_path="build/dev-release/libmbe-neo.so" ;;
+            macOS) lib_path="build/dev-release/libmbe-neo.dylib" ;;
+            *)
+              echo "Unsupported Unix runner OS: ${RUNNER_OS}" >&2
+              exit 1
+              ;;
+          esac
+          tools/check_release_hardening.sh "${lib_path}" build/dev-release
+          tools/check_release_hardening.sh build/dev-release/example_print_version build/dev-release
+      - name: Verify release hardening (Windows)
+        if: matrix.os == 'windows-latest' && matrix.preset == 'dev-release'
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path build/dev-release -Filter mbe-neo.dll -Recurse | Select-Object -First 1
+          $exe = Get-ChildItem -Path build/dev-release -Filter example_print_version.exe -Recurse | Select-Object -First 1
+          if ($null -eq $dll) { throw "mbe-neo.dll not found under build/dev-release" }
+          if ($null -eq $exe) { throw "example_print_version.exe not found under build/dev-release" }
+          ./tools/check_release_hardening.ps1 $dll.FullName
+          ./tools/check_release_hardening.ps1 $exe.FullName
+
+  sanitize-linux:
+    needs: [format-check, clang-tidy, cppcheck, lizard, scan-build, semgrep]
+    name: linux • Debug • sanitizers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Configure (asan-ubsan-debug)
+        run: cmake --preset asan-ubsan-debug
+      - name: Build (asan-ubsan-debug)
+        run: cmake --build --preset asan-ubsan-debug --parallel
+      - name: Test (asan-ubsan-debug)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --preset asan-ubsan-debug -V
+
+  format-check:
+    name: clang-format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Check formatting
+        run: |
+          bash tools/ci_arch_toolchain.sh bash -lc '
+            set -euo pipefail
+            mapfile -t files < <(git ls-files "*.c" "*.cc" "*.cxx" "*.cpp" "*.h" "*.hpp" ":!:build/**" ":!:src/external/**")
+            if [ "${#files[@]}" -eq 0 ]; then echo "No C/C++ files to check"; exit 0; fi
+            clang-format --version
+            if clang-format -n --Werror "${files[@]}" 2>/dev/null; then
+              echo "Formatting OK (clang-format -n --Werror)"
+            else
+              echo "clang-format -n --Werror unsupported or failed; using diff"
+              diff -u <(cat "${files[@]}") <(clang-format "${files[@]}") || (echo "Run tools/format.sh" && exit 1)
+            fi
+          '
+
+  clang-tidy:
+    name: clang-tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Load CI dependency pins
+        id: dep-pins
+        run: |
+          set -euxo pipefail
+          source tools/ci-dependency-pins.env
+          echo "iwyu_sha=${IWYU_SHA}" >> "$GITHUB_OUTPUT"
+      - name: Restore Arch toolchain cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .deps-arch-toolchain
+          key: arch-toolchain-${{ runner.os }}-iwyu-${{ steps.dep-pins.outputs.iwyu_sha }}
+          restore-keys: |
+            arch-toolchain-${{ runner.os }}-iwyu-
+      - name: Restore ccache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-arch-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-arch-${{ github.job }}-
+            ccache-${{ runner.os }}-arch-
+      - name: Run C/C++ static analysis under Arch toolchain
+        env:
+          CI_ARCH_IWYU_SHA: ${{ steps.dep-pins.outputs.iwyu_sha }}
+        run: |
+          bash tools/ci_arch_toolchain.sh bash -lc '
+            set -euxo pipefail
+            ccache --version
+            ccache --zero-stats
+            ccache --set-config=max_size=500M
+            ccache --set-config=compression=true
+            export CC="ccache gcc"
+            export CXX="ccache g++"
+            rm -rf build/dev-debug
+            cmake --preset dev-debug
+            tools/clang_tidy.sh
+            tools/iwyu.sh --strict
+            tools/gcc_fanalyzer.sh --strict
+            ccache -s
+          '
+      - name: Upload clang-tidy output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: clang-tidy-report
+          path: .clang-tidy.local.out
+          include-hidden-files: true
+          retention-days: 7
+      - name: Upload IWYU output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: iwyu-report
+          path: .iwyu.local.out
+          include-hidden-files: true
+          retention-days: 7
+      - name: Upload GCC fanalyzer output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gcc-fanalyzer-report
+          path: .gcc-fanalyzer.local.out
+          include-hidden-files: true
+          retention-days: 7
+  cppcheck:
+    name: cppcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Run cppcheck under Arch toolchain
+        run: |
+          bash tools/ci_arch_toolchain.sh bash -lc '
+            set -euxo pipefail
+            rm -rf build/dev-debug
+            cmake --preset dev-debug
+            tools/cppcheck.sh --strict
+          '
+      - name: Upload cppcheck output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cppcheck-report
+          path: .cppcheck.local.out
+          include-hidden-files: true
+          retention-days: 7
+
+  scan-build:
+    name: scan-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Run scan-build under Arch toolchain
+        run: |
+          bash tools/ci_arch_toolchain.sh tools/scan_build.sh --strict
+      - name: Upload scan-build output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scan-build-report
+          path: |
+            .scan-build.local.out
+            .scan-build.local
+          include-hidden-files: true
+          retention-days: 7
+
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
+      - name: Install Semgrep
+        run: python -m pip install --require-hashes -r .github/requirements/semgrep.txt
+      - name: Run Semgrep
+        env:
+          MBE_SEMGREP_SARIF_OUT: .semgrep.sarif
+        run: tools/semgrep.sh --strict
+      - name: Upload Semgrep SARIF
+        if: always() && hashFiles('.semgrep.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          sarif_file: .semgrep.sarif
+      - name: Upload Semgrep output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: semgrep-report
+          path: |
+            .semgrep.local.out
+            .semgrep.sarif
+          include-hidden-files: true
+          retention-days: 7
+
+  lizard:
+    name: lizard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
+      - name: Install Lizard
+        run: python -m pip install --require-hashes -r .github/requirements/lizard.txt
+      - name: Run Lizard
+        run: tools/lizard.sh --strict
+      - name: Upload Lizard output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lizard-report
+          path: .lizard.local.out
+          include-hidden-files: true
+          retention-days: 7
+
+  validate-release-tag:
+    name: Validate release tag
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.verify.outputs.version }}
+      archive_prefix: ${{ steps.verify.outputs.archive_prefix }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Validate release tag
+        id: verify
+        shell: bash
+        env:
+          RELEASE_TAG_CREATED: ${{ github.event.created }}
+        run: tools/ci_validate_release_tag.sh
+
+  update-aur-git:
+    name: Update AUR package (git)
+    needs: [format-check, clang-tidy, cppcheck, lizard, scan-build, semgrep, build-test, sanitize-linux, validate-release-tag]
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel@sha256:6db772fd1dd128b9cf7b7231ca5284af70879596fe4ec754c911cfc4ac30d5eb
+    env:
+      AUR_MAKEPKG_USER: aurbuilder
+    defaults:
+      run:
+        shell: bash
+    # Run on upstream non-PR refs. For version tags, only proceed after release validation succeeds.
+    if: >-
+      ${{
+        always() &&
+        github.repository == 'arancormonk/mbelib-neo' &&
+        github.event_name != 'pull_request' &&
+        needs.format-check.result == 'success' &&
+        needs.clang-tidy.result == 'success' &&
+        needs.cppcheck.result == 'success' &&
+        needs.lizard.result == 'success' &&
+        needs.scan-build.result == 'success' &&
+        needs.semgrep.result == 'success' &&
+        needs.build-test.result == 'success' &&
+        needs.sanitize-linux.result == 'success' &&
+        (
+          !startsWith(github.ref, 'refs/tags/v') ||
+          needs.validate-release-tag.result == 'success'
+        )
+      }}
+    steps:
+      - name: Check AUR SSH key availability
+        id: aur_key
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            echo "AUR_SSH_PRIVATE_KEY is not set; skipping AUR update steps."
+          else
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install AUR tooling
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: pacman -Syu --noconfirm --needed git openssh
+
+      - name: Create makepkg user
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          if ! id -u "$AUR_MAKEPKG_USER" >/dev/null 2>&1; then
+            useradd --create-home --shell /bin/bash "$AUR_MAKEPKG_USER"
+          fi
+
+      - name: Checkout repository
+        if: steps.aur_key.outputs.has_key == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Mark workspace as safe
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Refresh latest main ref
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: git fetch --force origin refs/heads/main:refs/remotes/origin/main --tags
+
+      - name: Setup SSH for AUR
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          mkdir -p "$HOME/.ssh"
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > "$HOME/.ssh/aur"
+          chmod 600 "$HOME/.ssh/aur"
+          ssh-keyscan -t ed25519 aur.archlinux.org >> "$HOME/.ssh/known_hosts"
+
+      - name: Clone AUR package
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          aur_ssh_command="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+          GIT_SSH_COMMAND="$aur_ssh_command" git clone ssh://aur@aur.archlinux.org/mbelib-neo-git.git aur-package
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/aur-package"
+
+      - name: Compute new pkgver
+        id: pkgver
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          ref="origin/main"
+          new_pkgver="$(
+            (
+              set -o pipefail
+              git describe --long --tags --abbrev=7 --match 'v[0-9]*.[0-9]*.[0-9]*' "$ref" 2>/dev/null |
+                sed 's/^v//;s/-/.r/;s/-/./'
+            ) || printf "r%s.%s" "$(git rev-list --count "$ref")" "$(git rev-parse --short=7 "$ref")"
+          )"
+          echo "pkgver=$new_pkgver" >> "$GITHUB_OUTPUT"
+          echo "Computed pkgver from $ref ($(git rev-parse --short=7 "$ref")): $new_pkgver"
+
+      - name: Validate AUR VCS metadata
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          set -euo pipefail
+          cd aur-package
+          expected="${{ steps.pkgver.outputs.pkgver }}"
+          if ! grep -Fq 'git+https://github.com/arancormonk/mbelib-neo.git#branch=main' PKGBUILD; then
+            echo "AUR PKGBUILD must explicitly track the upstream main branch." >&2
+            exit 1
+          fi
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cp -a . "$tmp/aur-package"
+          chown -R "$AUR_MAKEPKG_USER:$AUR_MAKEPKG_USER" "$tmp"
+          runuser -u "$AUR_MAKEPKG_USER" -- bash -lc "set -o pipefail; cd '$tmp/aur-package' && makepkg --nobuild --nodeps --skipinteg --noconfirm 2>&1 | tee makepkg.out"
+          actual="$(awk '/==> Updated version:/ { ver=$NF } END { sub(/-[^-]*$/, "", ver); print ver }' "$tmp/aur-package/makepkg.out")"
+          if [ -z "$actual" ]; then
+            actual="$(sed -n 's/^pkgver=//p' "$tmp/aur-package/PKGBUILD" | head -n1)"
+          fi
+          echo "Expected pkgver: $expected"
+          echo "Actual makepkg pkgver: $actual"
+          if [ "$actual" != "$expected" ]; then
+            echo "AUR PKGBUILD pkgver() is incompatible with CI-computed pkgver." >&2
+            exit 1
+          fi
+
+      - name: Check if update needed
+        id: check
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          cd aur-package
+          current_pkgver=$(grep -E '^\s*pkgver=' PKGBUILD | sed 's/.*pkgver=//')
+          echo "Current pkgver: $current_pkgver"
+          echo "New pkgver: ${{ steps.pkgver.outputs.pkgver }}"
+          if [ "$current_pkgver" = "${{ steps.pkgver.outputs.pkgver }}" ]; then
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "No update needed"
+          else
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+            echo "Update needed"
+          fi
+
+      - name: Update PKGBUILD
+        if: steps.aur_key.outputs.has_key == 'true' && steps.check.outputs.needs_update == 'true'
+        run: |
+          set -euo pipefail
+          cd aur-package
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.pkgver.outputs.pkgver }}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          chown -R "$AUR_MAKEPKG_USER:$AUR_MAKEPKG_USER" .
+          runuser -u "$AUR_MAKEPKG_USER" -- bash -lc "cd '$PWD' && makepkg --printsrcinfo > .SRCINFO"
+
+      - name: Commit and push to AUR
+        if: steps.aur_key.outputs.has_key == 'true' && steps.check.outputs.needs_update == 'true'
+        run: |
+          cd aur-package
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to ${{ steps.pkgver.outputs.pkgver }}"
+          aur_ssh_command="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+          GIT_SSH_COMMAND="$aur_ssh_command" git push origin master
+
+  update-aur-release:
+    name: Update AUR package (release)
+    needs: [format-check, clang-tidy, cppcheck, lizard, scan-build, semgrep, build-test, sanitize-linux, validate-release-tag]
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel@sha256:6db772fd1dd128b9cf7b7231ca5284af70879596fe4ec754c911cfc4ac30d5eb
+    env:
+      AUR_MAKEPKG_USER: aurbuilder
+    defaults:
+      run:
+        shell: bash
+    if: github.repository == 'arancormonk/mbelib-neo' && github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Check AUR SSH key availability
+        id: aur_key
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            echo "AUR_SSH_PRIVATE_KEY is not set; skipping AUR update steps."
+          else
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install AUR tooling
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: pacman -Syu --noconfirm --needed git openssh curl
+
+      - name: Create makepkg user
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          if ! id -u "$AUR_MAKEPKG_USER" >/dev/null 2>&1; then
+            useradd --create-home --shell /bin/bash "$AUR_MAKEPKG_USER"
+          fi
+
+      - name: Checkout repository
+        if: steps.aur_key.outputs.has_key == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Mark workspace as safe
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Setup SSH for AUR
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          mkdir -p "$HOME/.ssh"
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > "$HOME/.ssh/aur"
+          chmod 600 "$HOME/.ssh/aur"
+          ssh-keyscan -t ed25519 aur.archlinux.org >> "$HOME/.ssh/known_hosts"
+
+      - name: Clone AUR package
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          aur_ssh_command="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+          GIT_SSH_COMMAND="$aur_ssh_command" git clone ssh://aur@aur.archlinux.org/mbelib-neo.git aur-package
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/aur-package"
+
+      - name: Compute release metadata
+        id: release_meta
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          pkgver="${GITHUB_REF_NAME#v}"
+          source_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          sha256="$(
+            set -o pipefail
+            curl -fsSL "$source_url" | sha256sum | awk '{print $1}'
+          )"
+          echo "pkgver=$pkgver" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          echo "Computed release metadata: pkgver=$pkgver sha256=$sha256"
+
+      - name: Check if update needed
+        id: check
+        if: steps.aur_key.outputs.has_key == 'true'
+        run: |
+          cd aur-package
+          current_pkgver=$(sed -n 's/^pkgver=//p' PKGBUILD | head -n1)
+          current_sha256=$(sed -n "s/^sha256sums=('\\([0-9a-f]\\{64\\}\\)').*/\\1/p" PKGBUILD | head -n1)
+          echo "Current pkgver: $current_pkgver"
+          echo "Current sha256: $current_sha256"
+          echo "New pkgver: ${{ steps.release_meta.outputs.pkgver }}"
+          echo "New sha256: ${{ steps.release_meta.outputs.sha256 }}"
+          if [ "$current_pkgver" = "${{ steps.release_meta.outputs.pkgver }}" ] &&
+             [ "$current_sha256" = "${{ steps.release_meta.outputs.sha256 }}" ]; then
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "No update needed"
+          else
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+            echo "Update needed"
+          fi
+
+      - name: Update PKGBUILD
+        if: steps.aur_key.outputs.has_key == 'true' && steps.check.outputs.needs_update == 'true'
+        run: |
+          set -euo pipefail
+          cd aur-package
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.release_meta.outputs.pkgver }}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.release_meta.outputs.sha256 }}')/" PKGBUILD
+          chown -R "$AUR_MAKEPKG_USER:$AUR_MAKEPKG_USER" .
+          runuser -u "$AUR_MAKEPKG_USER" -- bash -lc "cd '$PWD' && makepkg --printsrcinfo > .SRCINFO"
+
+      - name: Validate AUR release source
+        if: steps.aur_key.outputs.has_key == 'true' && steps.check.outputs.needs_update == 'true'
+        run: |
+          set -euo pipefail
+          cd aur-package
+          runuser -u "$AUR_MAKEPKG_USER" -- bash -lc "cd '$PWD' && makepkg --verifysource --nodeps --noconfirm"
+
+      - name: Commit and push to AUR
+        if: steps.aur_key.outputs.has_key == 'true' && steps.check.outputs.needs_update == 'true'
+        run: |
+          cd aur-package
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to ${{ steps.release_meta.outputs.pkgver }}"
+          aur_ssh_command="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+          GIT_SSH_COMMAND="$aur_ssh_command" git push origin master
+
+  install-and-consume:
+    needs: [format-check, clang-tidy, cppcheck, lizard, scan-build, semgrep]
+    name: install + consume (pkg-config/CMake)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Ensure pkg-config is available (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config
+      - name: Ensure pkg-config is available (macOS)
+        if: runner.os == 'macOS'
+        run: brew update && brew install pkg-config
+      - name: Configure (dev-release preset)
+        run: cmake --preset dev-release
+      - name: Build (dev-release preset)
+        run: cmake --build --preset dev-release --parallel
+      - name: Install
+        run: cmake --install build/dev-release --prefix "$RUNNER_TEMP/mbe-install"
+      - name: Test pkg-config consumer
+        env:
+          PKG_CONFIG_PATH: ${{ runner.temp }}/mbe-install/lib/pkgconfig:${{ env.PKG_CONFIG_PATH }}
+        run: |
+          cat > consumer.c << 'EOF'
+          #include <stdio.h>
+          #include <mbelib-neo/mbelib.h>
+          int main(void) {
+            const char *ver = mbe_versionString();
+            printf("version: %s\n", ver);
+            return ver[0] ? 0 : 1;
+          }
+          EOF
+          read -r -a pkg_config_flags <<< "$(pkg-config --cflags --libs libmbe-neo)"
+          cc consumer.c "${pkg_config_flags[@]}" "-Wl,-rpath,${RUNNER_TEMP}/mbe-install/lib" -o consumer
+          ./consumer
+      - name: Test CMake package consumer
+        run: |
+          mkdir -p demo && cd demo
+          cat > CMakeLists.txt << 'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(consumer C)
+          find_package(mbe-neo CONFIG REQUIRED)
+          add_executable(consumer consumer.c)
+          target_link_libraries(consumer PRIVATE mbe_neo::mbe_shared)
+          EOF
+          cat > consumer.c << 'EOF'
+          #include <stdio.h>
+          #include <mbelib-neo/mbelib.h>
+          int main(void) {
+            const char *ver = mbe_versionString();
+            printf("version: %s\n", ver);
+            return ver[0] ? 0 : 1;
+          }
+          EOF
+          cmake -S . -B build -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/mbe-install" -DCMAKE_BUILD_RPATH="$RUNNER_TEMP/mbe-install/lib"
+          cmake --build build --parallel
+          ./build/consumer
+
+  install-and-consume-win:
+    needs: [format-check, clang-tidy, cppcheck, lizard, scan-build, semgrep]
+    name: install + consume (CMake, Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Configure (dev-release preset)
+        run: cmake --preset dev-release
+      - name: Build (dev-release preset)
+        run: cmake --build --preset dev-release --parallel
+      - name: Install
+        run: cmake --install build/dev-release --config Release --prefix "$env:RUNNER_TEMP\\mbe-install"
+      - name: Test CMake package consumer (static link)
+        shell: bash
+        run: |
+          mkdir -p demo && cd demo
+          cat > CMakeLists.txt << 'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(consumer C)
+          find_package(mbe-neo CONFIG REQUIRED)
+          add_executable(consumer consumer.c)
+          # Link static to avoid DLL path concerns in CI
+          target_link_libraries(consumer PRIVATE mbe_neo::mbe_static)
+          EOF
+          cat > consumer.c << 'EOF'
+          #include <stdio.h>
+          #include <mbelib-neo/mbelib.h>
+          int main(void) {
+            const char *ver = mbe_versionString();
+            printf("version: %s\n", ver);
+            return ver[0] ? 0 : 1;
+          }
+          EOF
+          cmake -S . -B build -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/mbe-install"
+          cmake --build build --config Release --parallel
+          ./build/Release/consumer.exe
+
+  package-release:
+    name: package release (${{ matrix.os }})
+    needs: [validate-release-tag, build-test, sanitize-linux, install-and-consume, install-and-consume-win]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+    permissions:
+      actions: read
+      attestations: write
+      artifact-metadata: write
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+          - os: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Configure (dev-release preset)
+        run: cmake --preset dev-release
+      - name: Build (dev-release preset)
+        run: cmake --build --preset dev-release --parallel
+      - name: Test (dev-release preset)
+        run: ctest --preset dev-release -V
+      - name: Verify release hardening (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          case "${RUNNER_OS}" in
+            Linux) lib_path="build/dev-release/libmbe-neo.so" ;;
+            macOS) lib_path="build/dev-release/libmbe-neo.dylib" ;;
+            *)
+              echo "Unsupported Unix runner OS: ${RUNNER_OS}" >&2
+              exit 1
+              ;;
+          esac
+          tools/check_release_hardening.sh "${lib_path}" build/dev-release
+          tools/check_release_hardening.sh build/dev-release/example_print_version build/dev-release
+      - name: Verify release hardening (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path build/dev-release -Filter mbe-neo.dll -Recurse | Select-Object -First 1
+          $exe = Get-ChildItem -Path build/dev-release -Filter example_print_version.exe -Recurse | Select-Object -First 1
+          if ($null -eq $dll) { throw "mbe-neo.dll not found under build/dev-release" }
+          if ($null -eq $exe) { throw "example_print_version.exe not found under build/dev-release" }
+          ./tools/check_release_hardening.ps1 $dll.FullName
+          ./tools/check_release_hardening.ps1 $exe.FullName
+      - name: Compute bundle name
+        id: bundle
+        shell: bash
+        env:
+          ARCHIVE_PREFIX: ${{ needs.validate-release-tag.outputs.archive_prefix }}
+        run: |
+          set -euxo pipefail
+          case "${RUNNER_OS}" in
+            Linux) platform="linux" ;;
+            macOS) platform="macos" ;;
+            Windows) platform="windows" ;;
+            *)
+              echo "Unsupported runner OS: ${RUNNER_OS}" >&2
+              exit 1
+              ;;
+          esac
+
+          arch=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          echo "bundle_name=${ARCHIVE_PREFIX}-${platform}-${arch}" >> "$GITHUB_OUTPUT"
+      - name: Package install tree (Unix)
+        if: runner.os != 'Windows'
+        id: package_unix
+        shell: bash
+        env:
+          BUNDLE_NAME: ${{ steps.bundle.outputs.bundle_name }}
+        run: |
+          set -euxo pipefail
+          staging_root="${RUNNER_TEMP}/release"
+          staging_dir="${staging_root}/${BUNDLE_NAME}"
+          archive_path="dist/${BUNDLE_NAME}.tar.gz"
+
+          rm -rf "${staging_dir}" "${archive_path}"
+          mkdir -p "${staging_dir}" dist
+
+          cmake --install build/dev-release --prefix "${staging_dir}"
+          tar -C "${staging_root}" -czf "${archive_path}" "${BUNDLE_NAME}"
+
+          echo "archive_path=${archive_path}" >> "$GITHUB_OUTPUT"
+      - name: Package install tree (Windows)
+        if: runner.os == 'Windows'
+        id: package_windows
+        shell: pwsh
+        env:
+          BUNDLE_NAME: ${{ steps.bundle.outputs.bundle_name }}
+        run: |
+          $stagingRoot = Join-Path $env:RUNNER_TEMP 'release'
+          $stagingDir = Join-Path $stagingRoot $env:BUNDLE_NAME
+          $archivePath = "dist/$($env:BUNDLE_NAME).zip"
+
+          if (Test-Path $stagingDir) {
+            Remove-Item $stagingDir -Recurse -Force
+          }
+          if (Test-Path $archivePath) {
+            Remove-Item $archivePath -Force
+          }
+
+          New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+          New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
+          cmake --install build/dev-release --config Release --prefix $stagingDir
+          Compress-Archive -Path $stagingDir -DestinationPath $archivePath -CompressionLevel Optimal
+
+          "archive_path=$archivePath" >> $env:GITHUB_OUTPUT
+      - name: Select release package path
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            archive_path='${{ steps.package_windows.outputs.archive_path }}'
+          else
+            archive_path='${{ steps.package_unix.outputs.archive_path }}'
+          fi
+          test -n "${archive_path}"
+          test -f "${archive_path}"
+          echo "archive_path=${archive_path}" >> "$GITHUB_OUTPUT"
+      - name: Upload release package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-package-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ steps.package.outputs.archive_path }}
+          retention-days: 7
+      - name: Generate release package SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          file: ${{ steps.package.outputs.archive_path }}
+          format: spdx-json
+          output-file: ${{ steps.package.outputs.archive_path }}.spdx.json
+          artifact-name: release-package-${{ runner.os }}-${{ runner.arch }}.spdx.json
+          upload-artifact: true
+          upload-release-assets: false
+      - name: Attest release package provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: ${{ steps.package.outputs.archive_path }}
+      - name: Attest release package SBOM
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: ${{ steps.package.outputs.archive_path }}
+          sbom-path: ${{ steps.package.outputs.archive_path }}.spdx.json
+
+  publish-release:
+    name: publish release
+    needs: [validate-release-tag, package-release]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'arancormonk/mbelib-neo'
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Download release package artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-package-*
+          path: dist
+          merge-multiple: true
+      - name: Verify release packages and generate checksums
+        shell: bash
+        env:
+          ARCHIVE_PREFIX: ${{ needs.validate-release-tag.outputs.archive_prefix }}
+        run: |
+          set -euo pipefail
+          mapfile -t packages < <(
+            find dist -maxdepth 1 -type f \
+              \( -name "${ARCHIVE_PREFIX}-*.tar.gz" -o -name "${ARCHIVE_PREFIX}-*.zip" \) |
+              sort
+          )
+          if [ "${#packages[@]}" -ne 3 ]; then
+            echo "Expected 3 release packages, found ${#packages[@]}." >&2
+            find dist -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
+          for platform in linux macos windows; do
+            if ! printf '%s\n' "${packages[@]}" | grep -Fq "/${ARCHIVE_PREFIX}-${platform}-"; then
+              echo "Missing ${platform} release package." >&2
+              exit 1
+            fi
+          done
+          for package in "${packages[@]}"; do
+            package_name="$(basename "$package")"
+            package_stem="${package_name%.tar.gz}"
+            package_stem="${package_stem%.zip}"
+            platform_arch="${package_stem#"${ARCHIVE_PREFIX}-"}"
+            platform="${platform_arch%-*}"
+            arch="${platform_arch##*-}"
+
+            case "${platform}" in
+              linux) artifact_os="Linux" ;;
+              macos) artifact_os="macOS" ;;
+              windows) artifact_os="Windows" ;;
+              *)
+                echo "Unsupported release package platform: ${platform}" >&2
+                exit 1
+                ;;
+            esac
+            case "${arch}" in
+              x64) artifact_arch="X64" ;;
+              arm64) artifact_arch="ARM64" ;;
+              *)
+                echo "Unsupported release package architecture: ${arch}" >&2
+                exit 1
+                ;;
+            esac
+
+            artifact_sbom="dist/release-package-${artifact_os}-${artifact_arch}.spdx.json"
+            if [ ! -f "${artifact_sbom}" ]; then
+              echo "Missing SBOM artifact for ${package_name}: ${artifact_sbom}" >&2
+              find dist -maxdepth 1 -type f -print >&2
+              exit 1
+            fi
+            mv "${artifact_sbom}" "${package}.spdx.json"
+          done
+          mapfile -t sboms < <(
+            find dist -maxdepth 1 -type f -name "${ARCHIVE_PREFIX}-*.spdx.json" |
+              sort
+          )
+          if [ "${#sboms[@]}" -ne 3 ]; then
+            echo "Expected 3 release package SBOMs, found ${#sboms[@]}." >&2
+            find dist -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
+          for package in "${packages[@]}"; do
+            if [ ! -f "${package}.spdx.json" ]; then
+              echo "Missing SBOM for $(basename "$package")." >&2
+              exit 1
+            fi
+          done
+          : > dist/SHA256SUMS.txt
+          for package in "${packages[@]}"; do
+            (
+              cd dist
+              sha256sum "$(basename "$package")"
+            ) >> dist/SHA256SUMS.txt
+          done
+          cat dist/SHA256SUMS.txt
+      - name: Attest checksum manifest
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: dist/SHA256SUMS.txt
+      - name: Upload release assets
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b
+        with:
+          files: |
+            dist/${{ needs.validate-release-tag.outputs.archive_prefix }}-*.tar.gz
+            dist/${{ needs.validate-release-tag.outputs.archive_prefix }}-*.zip
+            dist/${{ needs.validate-release-tag.outputs.archive_prefix }}-*.spdx.json
+            dist/SHA256SUMS.txt
+          name: mbelib-neo ${{ needs.validate-release-tag.outputs.version }}
+          generate_release_notes: true
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          token: ${{ github.token }}

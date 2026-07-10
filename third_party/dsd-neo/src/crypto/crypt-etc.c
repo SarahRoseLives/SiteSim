@@ -1,0 +1,772 @@
+// SPDX-License-Identifier: ISC
+#include <ctype.h>
+#include <dsd-neo/core/bp.h>
+#include <dsd-neo/core/state.h>
+#include <dsd-neo/crypto/dmr_keystream.h>
+#include <dsd-neo/platform/posix_compat.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "dsd-neo/core/safe_api.h"
+#include "dsd-neo/core/secret_redaction.h"
+#include "dsd-neo/core/state_fwd.h"
+
+static int
+parse_decimal_u32_strict(const char* token, uint32_t* out) {
+    if (token == NULL || out == NULL || token[0] == '\0') {
+        return 0;
+    }
+
+    uint64_t value = 0;
+    for (const unsigned char* p = (const unsigned char*)token; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') {
+            return 0;
+        }
+        value = (value * 10ULL) + (uint64_t)(*p - '0');
+        if (value > UINT32_MAX) {
+            return 0;
+        }
+    }
+
+    *out = (uint32_t)value;
+    return 1;
+}
+
+static int hex_nibble_value(int c);
+
+static int
+dmr_static_spec_fail(char* err, size_t err_cap, const char* message) {
+    if (err != NULL && err_cap > 0) {
+        (void)DSD_SNPRINTF(err, err_cap, "%s", message);
+    }
+    return 0;
+}
+
+static const char*
+skip_ascii_ws_const(const char* p) {
+    while (*p != '\0' && isspace((unsigned char)*p)) {
+        p++;
+    }
+    return p;
+}
+
+static int
+ascii_tail_is_ws(const char* p) {
+    while (*p != '\0') {
+        if (!isspace((unsigned char)*p)) {
+            return 0;
+        }
+        p++;
+    }
+    return 1;
+}
+
+static int
+parse_hex_u16_truncating_strict(const char* token, uint16_t* out) {
+    if (token == NULL || out == NULL) {
+        return 0;
+    }
+
+    const char* p = skip_ascii_ws_const(token);
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+    }
+
+    uint16_t value = 0U;
+    int digits = 0;
+    while (*p != '\0' && !isspace((unsigned char)*p)) {
+        int nib = hex_nibble_value((int)*p);
+        if (nib < 0) {
+            return 0;
+        }
+        value = (uint16_t)((value << 4U) | (uint16_t)nib);
+        digits++;
+        p++;
+    }
+
+    if (digits == 0 || !ascii_tail_is_ws(p)) {
+        return 0;
+    }
+    *out = value;
+    return 1;
+}
+
+static char*
+trim_ascii_ws(char* s) {
+    if (s == NULL) {
+        return NULL;
+    }
+    while (*s != '\0' && isspace((unsigned char)*s)) {
+        s++;
+    }
+    size_t n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n - 1])) {
+        s[--n] = '\0';
+    }
+    return s;
+}
+
+static int
+hex_nibble_value(int c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return 10 + (c - 'a');
+    }
+    if (c >= 'A' && c <= 'F') {
+        return 10 + (c - 'A');
+    }
+    return -1;
+}
+
+static int
+parse_hex_bytes_strict(const char* input, uint8_t* out, size_t out_cap, size_t* out_len) {
+    if (input == NULL || out == NULL || out_cap == 0 || out_len == NULL) {
+        return 0;
+    }
+
+    *out_len = 0;
+    int have_hi = 0;
+    int hi = 0;
+
+    for (const unsigned char* p = (const unsigned char*)input; *p != '\0'; p++) {
+        if (isspace(*p)) {
+            continue;
+        }
+        int nib = hex_nibble_value((int)*p);
+        if (nib < 0) {
+            return 0;
+        }
+
+        if (!have_hi) {
+            hi = nib;
+            have_hi = 1;
+        } else {
+            if (*out_len >= out_cap) {
+                return 0;
+            }
+            out[(*out_len)++] = (uint8_t)((hi << 4) | nib);
+            have_hi = 0;
+            hi = 0;
+        }
+    }
+
+    if (have_hi) {
+        if (*out_len >= out_cap) {
+            return 0;
+        }
+        out[(*out_len)++] = (uint8_t)(hi << 4);
+    }
+
+    return (*out_len > 0U) ? 1 : 0;
+}
+
+static void
+unpack_bytes_to_bits(const uint8_t* input, uint8_t* output, int len) {
+    int k = 0;
+    for (int i = 0; i < len; i++) {
+        output[k++] = (uint8_t)((input[i] >> 7) & 1U);
+        output[k++] = (uint8_t)((input[i] >> 6) & 1U);
+        output[k++] = (uint8_t)((input[i] >> 5) & 1U);
+        output[k++] = (uint8_t)((input[i] >> 4) & 1U);
+        output[k++] = (uint8_t)((input[i] >> 3) & 1U);
+        output[k++] = (uint8_t)((input[i] >> 2) & 1U);
+        output[k++] = (uint8_t)((input[i] >> 1) & 1U);
+        output[k++] = (uint8_t)((input[i] >> 0) & 1U);
+    }
+}
+
+int
+dmr_basic_privacy_apply_frame49(unsigned long long key_id, char ambe_d[49]) {
+    if (ambe_d == NULL || key_id == 0ULL || key_id >= (unsigned long long)(sizeof(BPK) / sizeof(BPK[0]))) {
+        return 0;
+    }
+
+    uint64_t k = BPK[(size_t)key_id];
+    k = (((k & 0xFF0FULL) << 32U) + (k << 16U) + k);
+    for (int j = 0; j < 48; j++) {
+        const int x = (int)(((k << (unsigned)j) & 0x800000000000ULL) >> 47U);
+        ambe_d[j] ^= (char)x;
+    }
+    return 1;
+}
+
+typedef struct {
+    char* len;
+    char* hex;
+    char* off;
+    char* step;
+} DmrStaticKeystreamTokens;
+
+static void
+dmr_static_spec_clear_error(char* err, size_t err_cap) {
+    if (err != NULL && err_cap > 0) {
+        err[0] = '\0';
+    }
+}
+
+static void
+dmr_static_spec_reset_outputs(uint8_t out_bits[882], int* out_mod, int* out_frame_mode, int* out_frame_off,
+                              int* out_frame_step) {
+    *out_mod = 0;
+    *out_frame_mode = 0;
+    *out_frame_off = 0;
+    *out_frame_step = 0;
+    DSD_MEMSET(out_bits, 0, 882 * sizeof(uint8_t));
+}
+
+static int
+dmr_static_spec_tokenize(char* spec, DmrStaticKeystreamTokens* tokens, char* err, size_t err_cap) {
+    char* saveptr = NULL;
+    tokens->len = dsd_strtok_r(spec, ":", &saveptr);
+    tokens->hex = dsd_strtok_r(NULL, ":", &saveptr);
+    tokens->off = dsd_strtok_r(NULL, ":", &saveptr);
+    tokens->step = dsd_strtok_r(NULL, ":", &saveptr);
+    const char* extra_tok = dsd_strtok_r(NULL, ":", &saveptr);
+
+    if (tokens->len == NULL || tokens->hex == NULL) {
+        return dmr_static_spec_fail(err, err_cap, "expected bits:hex[:offset[:step]]");
+    }
+    if (extra_tok != NULL) {
+        return dmr_static_spec_fail(err, err_cap, "too many ':' fields (max 4)");
+    }
+
+    tokens->len = trim_ascii_ws(tokens->len);
+    tokens->hex = trim_ascii_ws(tokens->hex);
+    if (tokens->off != NULL) {
+        tokens->off = trim_ascii_ws(tokens->off);
+    }
+    if (tokens->step != NULL) {
+        tokens->step = trim_ascii_ws(tokens->step);
+    }
+    return 1;
+}
+
+static int
+dmr_static_parse_length(const char* len_tok, uint32_t* parsed_len, char* err, size_t err_cap) {
+    if (parse_decimal_u32_strict(len_tok, parsed_len) != 1 || *parsed_len == 0 || *parsed_len > 882U) {
+        return dmr_static_spec_fail(err, err_cap, "length must be decimal 1..882 bits");
+    }
+    return 1;
+}
+
+static int
+dmr_static_parse_window(const DmrStaticKeystreamTokens* tokens, uint32_t parsed_len, int* frame_mode,
+                        uint32_t* frame_off, uint32_t* frame_step, char* err, size_t err_cap) {
+    *frame_mode = 0;
+    *frame_off = 0;
+    *frame_step = 0;
+
+    if (tokens->off != NULL && tokens->off[0] != '\0') {
+        *frame_mode = 1;
+        if (parse_decimal_u32_strict(tokens->off, frame_off) != 1) {
+            return dmr_static_spec_fail(err, err_cap, "offset must be decimal bits");
+        }
+        if (tokens->step != NULL && tokens->step[0] != '\0') {
+            if (parse_decimal_u32_strict(tokens->step, frame_step) != 1) {
+                return dmr_static_spec_fail(err, err_cap, "step must be decimal bits");
+            }
+        } else {
+            *frame_step = 49U;
+        }
+    } else if (tokens->step != NULL && tokens->step[0] != '\0') {
+        return dmr_static_spec_fail(err, err_cap, "step requires offset");
+    }
+
+    if (*frame_mode == 1) {
+        *frame_off %= parsed_len;
+        *frame_step %= parsed_len;
+    }
+    return 1;
+}
+
+static int
+dmr_static_parse_bits(const char* hex_tok, uint32_t parsed_len, uint8_t out_bits[882], char* err, size_t err_cap) {
+    if (hex_tok == NULL || hex_tok[0] == '\0') {
+        return dmr_static_spec_fail(err, err_cap, "missing keystream hex bytes");
+    }
+
+    uint8_t ks_bytes[112];
+    DSD_MEMSET(ks_bytes, 0, sizeof(ks_bytes));
+    size_t parsed_hex_bytes = 0;
+    if (parse_hex_bytes_strict(hex_tok, ks_bytes, sizeof(ks_bytes), &parsed_hex_bytes) != 1) {
+        return dmr_static_spec_fail(err, err_cap, "invalid hex bytes for keystream");
+    }
+
+    uint8_t ks_unpacked[896];
+    DSD_MEMSET(ks_unpacked, 0, sizeof(ks_unpacked));
+    uint16_t unpack_len = (uint16_t)(parsed_len / 8U);
+    if ((parsed_len % 8U) != 0U) {
+        unpack_len++;
+    }
+    if ((size_t)unpack_len > parsed_hex_bytes) {
+        return dmr_static_spec_fail(err, err_cap, "hex bytes shorter than requested bit length");
+    }
+    unpack_bytes_to_bits(ks_bytes, ks_unpacked, unpack_len);
+    for (uint32_t i = 0; i < parsed_len; i++) {
+        out_bits[i] = (uint8_t)(ks_unpacked[i] & 1U);
+    }
+    return 1;
+}
+
+int
+dmr_parse_static_keystream_spec(const char* input, uint8_t out_bits[882], int* out_mod, int* out_frame_mode,
+                                int* out_frame_off, int* out_frame_step, char* err, size_t err_cap) {
+    if (out_bits == NULL || out_mod == NULL || out_frame_mode == NULL || out_frame_off == NULL
+        || out_frame_step == NULL) {
+        return dmr_static_spec_fail(err, err_cap, "internal parser argument error");
+    }
+
+    dmr_static_spec_clear_error(err, err_cap);
+    dmr_static_spec_reset_outputs(out_bits, out_mod, out_frame_mode, out_frame_off, out_frame_step);
+
+    if (input == NULL || input[0] == '\0') {
+        return dmr_static_spec_fail(err, err_cap, "keystream spec is empty");
+    }
+
+    char spec[512];
+    (void)DSD_SNPRINTF(spec, sizeof spec, "%s", input);
+
+    DmrStaticKeystreamTokens tokens;
+    if (dmr_static_spec_tokenize(spec, &tokens, err, err_cap) != 1) {
+        return 0;
+    }
+
+    uint32_t parsed_len = 0;
+    if (dmr_static_parse_length(tokens.len, &parsed_len, err, err_cap) != 1) {
+        return 0;
+    }
+
+    int frame_mode = 0;
+    uint32_t frame_off = 0;
+    uint32_t frame_step = 0;
+    if (dmr_static_parse_window(&tokens, parsed_len, &frame_mode, &frame_off, &frame_step, err, err_cap) != 1) {
+        return 0;
+    }
+
+    if (dmr_static_parse_bits(tokens.hex, parsed_len, out_bits, err, err_cap) != 1) {
+        return 0;
+    }
+
+    int mod = (int)parsed_len;
+    *out_mod = mod;
+    *out_frame_mode = frame_mode;
+    *out_frame_off = (int)frame_off;
+    *out_frame_step = (int)frame_step;
+    return 1;
+}
+
+void
+ken_dmr_scrambler_keystream_creation(dsd_state* state, char* input, int show_keys) {
+    /*
+  SLOT 1 Protected LC  FLCO=0x00 FID=0x20 <--this link appears to indicate scrambler usage from Kenwood on DMR
+  DMR PDU Payload [80][20][40][00][00][01][00][00][01] SB: 00000000000 - 000;
+
+  SLOT 1 TGT=1 SRC=1 FLCO=0x00 FID=0x00 SVC=0x00 Group Call <--different call, no scrambler from same Kenwood Radio
+  DMR PDU Payload [00][00][00][00][00][01][00][00][01]
+
+  For This, we could possible transition this to not be enforced
+  since we may have a positive indicator in link control, 
+  but needs further samples and validation
+  */
+
+    int lfsr = 0;
+    {
+        uint32_t parsed = 0U;
+        if (parse_decimal_u32_strict(trim_ascii_ws(input), &parsed)) {
+            lfsr = (int)parsed;
+        }
+    }
+    char key_text[16];
+    DSD_FPRINTF(stderr, "DMR Kenwood 15-bit scrambler key loaded with forced application: %s\n",
+                dsd_secret_format_decimal(key_text, sizeof key_text, show_keys, (unsigned long long)lfsr, 5U));
+
+    for (int i = 0; i < 882; i++) {
+        state->static_ks_bits[0][i] = lfsr & 0x1;
+        state->static_ks_bits[1][i] = lfsr & 0x1;
+        int bit = ((lfsr >> 1) ^ (lfsr >> 0)) & 1;
+        lfsr = ((lfsr >> 1) | (bit << 14));
+    }
+
+    state->ken_sc = 1;
+}
+
+void
+anytone_bp_keystream_creation(dsd_state* state, char* input, int show_keys) {
+    uint16_t key = 0;
+    uint16_t kperm = 0;
+
+    (void)parse_hex_u16_truncating_strict(trim_ascii_ws(input), &key);
+    key &= 0xFFFF; //truncate to 16-bits
+
+    //calculate key permutation using simple operations
+    uint8_t nib1, nib2, nib3, nib4;
+
+    //nib 1 and 3 are simple inversions
+    nib1 = ~(key >> 12) & 0xF;
+    nib3 = ~(key >> 4) & 0xF;
+
+    //nib 2 and 4 are +8 and mod 16 (& 0xF)
+    nib2 = (((key >> 8) & 0xF) + 8) % 16;
+    nib4 = (((key >> 0) & 0xF) + 8) % 16;
+
+    //debug
+    // DSD_FPRINTF(stderr, "{%01X, %01X, %01X, %01X}", nib1, nib2, nib3, nib4);
+
+    kperm = nib1;
+    kperm <<= 4;
+    kperm |= nib2;
+    kperm <<= 4;
+    kperm |= nib3;
+    kperm <<= 4;
+    kperm |= nib4;
+
+    //load bits into static keystream
+    for (int i = 0; i < 16; i++) {
+        state->static_ks_bits[0][i] = (kperm >> (15 - i)) & 1;
+        state->static_ks_bits[1][i] = (kperm >> (15 - i)) & 1;
+    }
+
+    char key_text[16];
+    DSD_FPRINTF(stderr, "DMR Anytone Basic 16-bit key loaded with forced application: %s\n",
+                dsd_secret_format_hex(key_text, sizeof key_text, show_keys, key, 4U, 1));
+    state->any_bp = 1;
+}
+
+void
+straight_mod_xor_keystream_creation(dsd_state* state, const char* input, int show_keys) {
+    if (state == NULL || input == NULL) {
+        return;
+    }
+
+    /* Reset first so malformed input always disables forced static KS. */
+    state->straight_ks = 0;
+    state->straight_mod = 0;
+    state->straight_frame_mode = 0;
+    state->straight_frame_off = 0;
+    state->straight_frame_step = 0;
+    DSD_MEMSET(state->static_ks_counter, 0, sizeof(state->static_ks_counter));
+
+    uint8_t parsed_bits[882];
+    int parsed_mod = 0;
+    int parsed_frame_mode = 0;
+    int parsed_frame_off = 0;
+    int parsed_frame_step = 0;
+    char err[128];
+    if (dmr_parse_static_keystream_spec(input, parsed_bits, &parsed_mod, &parsed_frame_mode, &parsed_frame_off,
+                                        &parsed_frame_step, err, sizeof err)
+        != 1) {
+        if (err[0] != '\0') {
+            DSD_FPRINTF(stderr, "Straight KS parse failure (%s)\n", err);
+        }
+        DSD_FPRINTF(stderr, "Straight KS String Malformed! No KS Created!\n");
+        return;
+    }
+
+    for (int i = 0; i < parsed_mod; i++) {
+        state->static_ks_bits[0][i] = parsed_bits[i];
+        state->static_ks_bits[1][i] = parsed_bits[i];
+    }
+
+    uint8_t packed_ks[111];
+    DSD_MEMSET(packed_ks, 0, sizeof(packed_ks));
+    int unpack_len = parsed_mod / 8;
+    if ((parsed_mod % 8) != 0) {
+        unpack_len++;
+    }
+    for (int byte_idx = 0; byte_idx < unpack_len; byte_idx++) {
+        uint8_t out = 0U;
+        for (int bit = 0; bit < 8; bit++) {
+            out <<= 1U;
+            int bi = (byte_idx * 8) + bit;
+            if (bi < parsed_mod) {
+                out |= (uint8_t)(parsed_bits[bi] & 1U);
+            }
+        }
+        packed_ks[byte_idx] = out;
+    }
+
+    char ks_text[223];
+    char mod_text[16];
+    (void)DSD_SNPRINTF(mod_text, sizeof mod_text, "%d", parsed_mod);
+    DSD_FPRINTF(stderr, "AMBE Straight XOR %s-bit keystream loaded: %s", mod_text,
+                dsd_secret_format_byte_hex(ks_text, sizeof ks_text, show_keys, packed_ks, (size_t)unpack_len));
+    if (parsed_frame_mode == 1) {
+        DSD_FPRINTF(stderr, " with Frame Align (offset=%d, step=%d)", parsed_frame_off, parsed_frame_step);
+    }
+    DSD_FPRINTF(stderr, " with Forced Application \n");
+
+    state->straight_ks = 1;
+    state->straight_mod = parsed_mod;
+    state->straight_frame_mode = parsed_frame_mode;
+    state->straight_frame_off = parsed_frame_off;
+    state->straight_frame_step = parsed_frame_step;
+}
+
+static void
+xor_keystream_bits_frame49(const uint8_t* ks_bits, int mod, int frame_mode, int frame_off, int frame_step, int* counter,
+                           char ambe_d[49]) {
+    if (ks_bits == NULL || counter == NULL || ambe_d == NULL || mod <= 0) {
+        return;
+    }
+
+    int base = 0;
+    if (frame_mode == 1) {
+        uint32_t frame_ctr = (uint32_t)(*counter);
+        (*counter)++;
+        uint32_t off = (uint32_t)((frame_off >= 0) ? frame_off : 0);
+        uint32_t step = (uint32_t)((frame_step >= 0) ? frame_step : 0);
+        off %= (uint32_t)mod;
+        step %= (uint32_t)mod;
+        const uint64_t mod_u64 = (uint64_t)(uint32_t)mod;
+        const uint64_t advance = (((uint64_t)frame_ctr) * ((uint64_t)step)) % mod_u64;
+        base = (int)((((uint64_t)off) + advance) % mod_u64);
+    } else {
+        base = (*counter) % mod;
+        if (base < 0) {
+            base += mod;
+        }
+        *counter += 49;
+    }
+
+    for (int i = 0; i < 49; i++) {
+        int idx = (base + i) % mod;
+        ambe_d[i] ^= (char)(ks_bits[idx] & 1U);
+    }
+}
+
+static int
+dmr_ambe49_should_skip_static_overlay(const char ambe_d[49]) {
+    return dmr_ambe49_is_default_silence(ambe_d) == 1 || dmr_ambe49_has_zero_tail(ambe_d) == 1;
+}
+
+static void
+dmr_static_advance_skipped_frame(int frame_mode, int* counter) {
+    if (counter == NULL) {
+        return;
+    }
+    *counter += (frame_mode == 1) ? 1 : 49;
+}
+
+int
+ken_dmr_scrambler_apply_frame49(dsd_state* state, int slot, char ambe_d[49]) {
+    if (state == NULL || ambe_d == NULL || state->ken_sc != 1) {
+        return 0;
+    }
+
+    slot = (slot == 1) ? 1 : 0;
+    if (dmr_ambe49_should_skip_static_overlay(ambe_d) == 1) {
+        dmr_static_advance_skipped_frame(0, &state->static_ks_counter[slot]);
+        return 0;
+    }
+
+    xor_keystream_bits_frame49(state->static_ks_bits[slot], 882, 0, 0, 0, &state->static_ks_counter[slot], ambe_d);
+    return 1;
+}
+
+int
+anytone_bp_apply_frame49(dsd_state* state, int slot, char ambe_d[49]) {
+    if (state == NULL || ambe_d == NULL || state->any_bp != 1) {
+        return 0;
+    }
+
+    slot = (slot == 1) ? 1 : 0;
+    if (dmr_ambe49_should_skip_static_overlay(ambe_d) == 1) {
+        dmr_static_advance_skipped_frame(0, &state->static_ks_counter[slot]);
+        return 0;
+    }
+
+    xor_keystream_bits_frame49(state->static_ks_bits[slot], 16, 0, 0, 0, &state->static_ks_counter[slot], ambe_d);
+    return 1;
+}
+
+void
+straight_mod_xor_apply_frame49(dsd_state* state, int slot, char ambe_d[49]) {
+    if (state == NULL || ambe_d == NULL) {
+        return;
+    }
+    if (state->straight_ks != 1 || state->straight_mod <= 0) {
+        return;
+    }
+
+    slot = (slot == 1) ? 1 : 0;
+    if (dmr_ambe49_should_skip_static_overlay(ambe_d) == 1) {
+        dmr_static_advance_skipped_frame(state->straight_frame_mode, &state->static_ks_counter[slot]);
+        return;
+    }
+
+    xor_keystream_bits_frame49(state->static_ks_bits[slot], state->straight_mod, state->straight_frame_mode,
+                               state->straight_frame_off, state->straight_frame_step, &state->static_ks_counter[slot],
+                               ambe_d);
+}
+
+int
+dmr_ambe49_is_default_silence(const char ambe_d[49]) {
+    static const uint64_t k_ambe_default_silence = 0xF801A99F8CE080ULL;
+
+    if (ambe_d == NULL) {
+        return 0;
+    }
+
+    for (int i = 0; i < 49; i++) {
+        const uint8_t want = (uint8_t)((k_ambe_default_silence >> (55 - i)) & 1U);
+        const uint8_t got = (uint8_t)(((unsigned char)ambe_d[i]) & 1U);
+        if (got != want) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+int
+dmr_ambe49_has_zero_tail(const char ambe_d[49]) {
+    if (ambe_d == NULL) {
+        return 0;
+    }
+
+    for (int i = 24; i < 44; i++) {
+        if ((((unsigned char)ambe_d[i]) & 1U) != 0U) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int
+dmr_ambe49_should_skip_voice_stream(const char ambe_d[49]) {
+    return dmr_ambe49_is_default_silence(ambe_d) == 1 || dmr_ambe49_has_zero_tail(ambe_d) == 1;
+}
+
+int
+dmr_voice_stream_apply_frame49(const uint8_t* ks_bits, long int* bit_counter, int algid, char ambe_d[49]) {
+    if (ks_bits == NULL || bit_counter == NULL || ambe_d == NULL) {
+        return 0;
+    }
+
+    if (*bit_counter < 0) {
+        *bit_counter = 0;
+    }
+
+    if (dmr_ambe49_should_skip_voice_stream(ambe_d) == 1) {
+        *bit_counter += 49;
+        if (algid != 0x02) {
+            *bit_counter += 7;
+        }
+        return 0;
+    }
+
+    for (int i = 0; i < 49; i++) {
+        ambe_d[i] ^= (char)(ks_bits[*bit_counter] & 1U);
+        (*bit_counter)++;
+    }
+    if (algid != 0x02) {
+        *bit_counter += 7;
+    }
+    return 1;
+}
+
+int
+hytera_bp_apply_frame49(unsigned long long k1, unsigned long long k2, unsigned long long k3, unsigned long long k4,
+                        int* frame_counter, char ambe_d[49]) {
+    if (frame_counter == NULL || ambe_d == NULL) {
+        return 0;
+    }
+
+    int frame = *frame_counter;
+    if (frame < 0) {
+        frame = 0;
+    } else if (frame > 17) {
+        frame = 17;
+    }
+
+    if (dmr_ambe49_is_default_silence(ambe_d) == 1) {
+        *frame_counter = frame + 1;
+        return 0;
+    }
+
+    int len = 0;
+    if (k2 == 0ULL) {
+        len = 39;
+        k1 <<= 24;
+    } else {
+        len = 127;
+    }
+    if (k4 != 0ULL) {
+        len = 255;
+    }
+
+    uint8_t t_key[256] = {0};
+    uint8_t p_n[882] = {0};
+
+    for (int i = 0; i < 64; i++) {
+        t_key[i] = (uint8_t)((k1 >> (63 - i)) & 1ULL);
+        t_key[i + 64] = (uint8_t)((k2 >> (63 - i)) & 1ULL);
+        t_key[i + 128] = (uint8_t)((k3 >> (63 - i)) & 1ULL);
+        t_key[i + 192] = (uint8_t)((k4 >> (63 - i)) & 1ULL);
+    }
+
+    int pos = 0;
+    for (int i = 0; i < 882; i++) {
+        p_n[i] = t_key[pos];
+        pos++;
+        if (pos > len) {
+            pos = 0;
+        }
+    }
+
+    pos = frame * 49;
+    for (int i = 0; i < 49; i++) {
+        ambe_d[i] ^= (char)(p_n[pos++] & 1U);
+    }
+
+    *frame_counter = frame + 1;
+    return 1;
+}
+
+static int
+vertex_key_map_find_index(const dsd_state* state, unsigned long long key) {
+    if (state == NULL || state->vertex_ks_count <= 0) {
+        return -1;
+    }
+    const int count = (state->vertex_ks_count > DSD_VERTEX_KS_MAP_MAX) ? DSD_VERTEX_KS_MAP_MAX : state->vertex_ks_count;
+    for (int i = 0; i < count; i++) {
+        if (state->vertex_ks_key[i] == key && state->vertex_ks_mod[i] > 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int
+vertex_key_map_apply_frame49(dsd_state* state, int slot, unsigned long long key, char ambe_d[49]) {
+    if (state == NULL || ambe_d == NULL) {
+        return 0;
+    }
+
+    slot = (slot == 1) ? 1 : 0;
+    int idx = -1;
+    const int active = state->vertex_ks_active_idx[slot];
+    if (active >= 0 && active < state->vertex_ks_count && active < DSD_VERTEX_KS_MAP_MAX
+        && state->vertex_ks_key[active] == key && state->vertex_ks_mod[active] > 0) {
+        idx = active;
+    } else {
+        idx = vertex_key_map_find_index(state, key);
+        if (idx < 0) {
+            return 0;
+        }
+        state->vertex_ks_active_idx[slot] = idx;
+        state->vertex_ks_counter[slot] = 0;
+    }
+
+    if (dmr_ambe49_should_skip_static_overlay(ambe_d) == 1) {
+        dmr_static_advance_skipped_frame(state->vertex_ks_frame_mode[idx], &state->vertex_ks_counter[slot]);
+        return 1;
+    }
+
+    xor_keystream_bits_frame49(state->vertex_ks_bits[idx], state->vertex_ks_mod[idx], state->vertex_ks_frame_mode[idx],
+                               state->vertex_ks_frame_off[idx], state->vertex_ks_frame_step[idx],
+                               &state->vertex_ks_counter[slot], ambe_d);
+    return 1;
+}

@@ -1,0 +1,1266 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
+ */
+
+/**
+ * @file
+ * @brief Async callback handlers for menu prompts.
+ */
+
+#include "menu_callbacks.h"
+#include <dsd-neo/app_control/commands.h>
+#include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/state.h>
+#include <dsd-neo/platform/posix_compat.h>
+#include <dsd-neo/runtime/config.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include "dsd-neo/core/safe_api.h"
+#include "dsd-neo/ui/menu_core.h"
+#include "menu_env.h"
+#include "menu_internal.h"
+#include "menu_prompts.h"
+
+static int
+clamp_int_with_notice(const char* label, int value, int min_v, int max_v, int* adjusted) {
+    int out = value;
+    if (out < min_v) {
+        out = min_v;
+    }
+    if (out > max_v) {
+        out = max_v;
+    }
+    if (adjusted) {
+        *adjusted = (out != value) ? 1 : 0;
+    }
+    if (out != value) {
+        ui_statusf("%s adjusted to %d (range %d..%d)", label ? label : "Value", out, min_v, max_v);
+    }
+    return out;
+}
+
+static double
+clamp_double_with_notice(const char* label, double value, double min_v, double max_v, int* adjusted) {
+    double out = value;
+    int was_adjusted = 0;
+    if (out < min_v) {
+        out = min_v;
+        was_adjusted = 1;
+    }
+    if (out > max_v) {
+        out = max_v;
+        was_adjusted = 1;
+    }
+    if (adjusted) {
+        *adjusted = was_adjusted;
+    }
+    if (was_adjusted) {
+        ui_statusf("%s adjusted to %.3f (range %.3f..%.3f)", label ? label : "Value", out, min_v, max_v);
+    }
+    return out;
+}
+
+static UiCtx*
+mutable_ui_ctx_from_callback(void* user) {
+    return (UiCtx*)user;
+}
+
+// ---- Simple path callbacks ----
+
+void
+cb_event_log_set(void* v, const char* path) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (path && *path) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_EVENT_LOG_SET, path);
+        ui_statusf("Applying event log output...");
+    }
+}
+
+void
+cb_static_wav(void* v, const char* path) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (path && *path) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_WAV_STATIC_OPEN, path);
+        ui_statusf("Applying static WAV output...");
+    }
+}
+
+void
+cb_raw_wav(void* v, const char* path) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (path && *path) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_WAV_RAW_OPEN, path);
+        ui_statusf("Applying raw WAV output...");
+    }
+}
+
+void
+cb_dsp_out(void* v, const char* name) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (name && *name) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_DSP_OUT_SET, name);
+        ui_statusf("Applying DSP output path...");
+    }
+}
+
+void
+cb_import_chan(void* v, const char* p) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (p && *p) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_IMPORT_CHANNEL_MAP, p);
+        ui_statusf("Importing channel map...");
+    }
+}
+
+void
+cb_import_group(void* v, const char* p) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (p && *p) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_IMPORT_GROUP_LIST, p);
+        ui_statusf("Importing group list...");
+    }
+}
+
+void
+cb_keys_dec(void* v, const char* p) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (p && *p) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_IMPORT_KEYS_DEC, p);
+        ui_statusf("Importing keys (DEC)...");
+    }
+}
+
+void
+cb_keys_hex(void* v, const char* p) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (p && *p) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_IMPORT_KEYS_HEX, p);
+        ui_statusf("Importing keys (HEX)...");
+    }
+}
+
+// ---- Config callbacks ----
+
+static void
+ui_submit_config_metadata(int autosave_enabled, const char* path) {
+    dsd_app_config_metadata_payload payload;
+    DSD_MEMSET(&payload, 0, sizeof payload);
+    payload.autosave_enabled = autosave_enabled ? 1 : 0;
+    DSD_SNPRINTF(payload.path, sizeof payload.path, "%s", path ? path : "");
+    payload.path[sizeof payload.path - 1] = '\0';
+    (void)dsd_app_command_set_config_metadata(&payload);
+}
+
+void
+cb_config_load(void* v, const char* path) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (!path || !*path) {
+        ui_statusf("Config load canceled");
+        return;
+    }
+
+    dsdneoUserConfig cfg;
+    DSD_MEMSET(&cfg, 0, sizeof cfg);
+    if (dsd_user_config_load(path, &cfg) != 0) {
+        ui_statusf("Failed to load config from %s", path);
+        return;
+    }
+
+    ui_submit_config_metadata(1, path);
+    (void)dsd_app_command_apply_config(&cfg);
+    ui_statusf("Config loaded from %s", path);
+}
+
+static void
+config_profile_free_context(ProfileSelCtx* pctx) {
+    if (!pctx) {
+        return;
+    }
+    if (pctx->names) {
+        for (int i = 0; i < pctx->n; i++) {
+            free((void*)pctx->names[i]);
+        }
+    }
+    free((void*)pctx->labels);
+    free((void*)pctx->names);
+    free(pctx);
+}
+
+void
+chooser_done_config_profile(void* u, int sel) {
+    ProfileSelCtx* pctx = (ProfileSelCtx*)u;
+    if (!pctx) {
+        return;
+    }
+
+    if (sel >= 0 && sel < pctx->n && pctx->names && pctx->names[sel] && pctx->path[0] != '\0') {
+        const char* profile = pctx->names[sel];
+        dsdneoUserConfig cfg;
+        DSD_MEMSET(&cfg, 0, sizeof cfg);
+        if (dsd_user_config_load_profile(pctx->path, profile, &cfg) != 0) {
+            ui_statusf("Failed to load profile %s from %s", profile, pctx->path);
+        } else {
+            ui_submit_config_metadata(0, pctx->path);
+            (void)dsd_app_command_apply_config(&cfg);
+            ui_statusf("Profile loaded: %s", profile);
+        }
+    }
+
+    config_profile_free_context(pctx);
+}
+
+void
+cb_config_save_as(void* v, const char* path) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (!path || !*path) {
+        ui_statusf("Config save canceled");
+        return;
+    }
+    dsdneoUserConfig cfg;
+    dsd_snapshot_opts_to_user_config(c->opts, c->state, &cfg);
+    if (dsd_user_config_save_atomic(path, &cfg) == 0) {
+        ui_submit_config_metadata(1, path);
+        ui_statusf("Config saved to %s", path);
+    } else {
+        ui_statusf("Failed to save config to %s", path);
+    }
+}
+
+// ---- Typed value callbacks ----
+
+void
+cb_setmod_bw(void* v, int ok, int bw) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        int adjusted = 0;
+        int32_t hz = (int32_t)clamp_int_with_notice("Rigctl BW", bw, 0, 25000, &adjusted);
+        (void)dsd_app_command_set_i32(DSD_APP_CMD_RIGCTL_SET_MOD_BW, hz);
+        if (!adjusted) {
+            ui_statusf("Applying Rigctl BW: %d Hz", (int)hz);
+        }
+    }
+}
+
+void
+cb_tg_hold(void* v, int ok, int tg) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        int adjusted = 0;
+        int tg_safe = clamp_int_with_notice("TG Hold", tg, 0, 2147483647, &adjusted);
+        uint32_t t = (uint32_t)tg_safe;
+        (void)dsd_app_command_set_u32(DSD_APP_CMD_TG_HOLD_SET, t);
+        if (!adjusted) {
+            ui_statusf("Applying TG Hold: %u", t);
+        }
+    }
+}
+
+void
+cb_hangtime(void* v, int ok, double s) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        int adjusted = 0;
+        double d = s;
+        if (d < 0.0) {
+            d = 0.0;
+            adjusted = 1;
+            ui_statusf("Hangtime adjusted to %.3f (range >= 0)", d);
+        }
+        (void)dsd_app_command_set_double(DSD_APP_CMD_HANGTIME_SET, d);
+        if (!adjusted) {
+            ui_statusf("Applying hangtime: %.3f s", d);
+        }
+    }
+}
+
+void
+cb_slot_pref(void* v, int ok, int p) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        int adjusted = 0;
+        p = clamp_int_with_notice("Slot preference", p, 1, 2, &adjusted);
+        int32_t pref01 = p - 1;
+        (void)dsd_app_command_set_i32(DSD_APP_CMD_SLOT_PREF_SET, pref01);
+        if (!adjusted) {
+            ui_statusf("Applying slot preference: %d", p);
+        }
+    }
+}
+
+void
+cb_slots_on(void* v, int ok, int m) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        int adjusted = 0;
+        int32_t mask = (int32_t)clamp_int_with_notice("Slot mask", m, 0, 3, &adjusted);
+        (void)dsd_app_command_set_i32(DSD_APP_CMD_SLOTS_ONOFF_SET, mask);
+        if (!adjusted) {
+            ui_statusf("Applying slot mask: %d", (int)mask);
+        }
+    }
+}
+
+// ---- Keystream callbacks ----
+
+void
+cb_tyt_ap(void* v, const char* s) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (s && *s) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_KEY_TYT_AP_SET, s);
+        ui_statusf("TYT AP keystream set requested");
+    }
+}
+
+void
+cb_retevis_rc2(void* v, const char* s) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (s && *s) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_KEY_RETEVIS_RC2_SET, s);
+        ui_statusf("Retevis AP keystream set requested");
+    }
+}
+
+void
+cb_tyt_ep(void* v, const char* s) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (s && *s) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_KEY_TYT_EP_SET, s);
+        ui_statusf("TYT EP keystream set requested");
+    }
+}
+
+void
+cb_ken_scr(void* v, const char* s) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (s && *s) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_KEY_KEN_SCR_SET, s);
+        ui_statusf("Kenwood scrambler keystream set requested");
+    }
+}
+
+void
+cb_anytone_bp(void* v, const char* s) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (s && *s) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_KEY_ANYTONE_BP_SET, s);
+        ui_statusf("Anytone BP keystream set requested");
+    }
+}
+
+void
+cb_xor_ks(void* v, const char* s) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (s && *s) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_KEY_XOR_SET, s);
+        ui_statusf("XOR keystream set requested");
+    }
+}
+
+// ---- Key entry callbacks ----
+
+void
+cb_key_basic(void* v, int ok, int val) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        unsigned long long vdec = val;
+        if (vdec > 255ULL) {
+            vdec = 255ULL;
+        }
+        uint32_t k = (uint32_t)vdec;
+        (void)dsd_app_command_set_u32(DSD_APP_CMD_KEY_BASIC_SET, k);
+    }
+}
+
+void
+cb_key_scrambler(void* v, int ok, int val) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        unsigned long long vdec = val;
+        if (vdec > 0x7FFFULL) {
+            vdec = 0x7FFFULL;
+        }
+        uint32_t r = (uint32_t)vdec;
+        (void)dsd_app_command_set_u32(DSD_APP_CMD_KEY_SCRAMBLER_SET, r);
+    }
+}
+
+void
+cb_key_rc4des(void* v, const char* text) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (text && *text) {
+        unsigned long long th = 0ULL;
+        if (parse_hex_u64(text, &th)) {
+            uint64_t r = th;
+            (void)dsd_app_command_set_u64(DSD_APP_CMD_KEY_RC4DES_SET, r);
+        }
+    }
+}
+
+// ---- Multi-step callbacks ----
+
+static int
+parse_required_hex(const char* text, unsigned long long* out) {
+    if (!text || !*text || !out) {
+        return 0;
+    }
+    return parse_hex_u64(text, out) ? 1 : 0;
+}
+
+static const char*
+hytera_step_title(int step) {
+    switch (step) {
+        case 0: return "Hytera Privacy Key 1 (HEX)";
+        case 1: return "Hytera Privacy Key 2 (HEX) or 0";
+        case 2: return "Hytera Privacy Key 3 (HEX) or 0";
+        case 3: return "Hytera Privacy Key 4 (HEX) or 0";
+        default: return "Hytera Privacy Key (HEX)";
+    }
+}
+
+static const char*
+aes_step_title(int step) {
+    switch (step) {
+        case 0: return "AES Segment 1 (HEX) or 0";
+        case 1: return "AES Segment 2 (HEX) or 0";
+        case 2: return "AES Segment 3 (HEX) or 0";
+        case 3: return "AES Segment 4 (HEX) or 0";
+        default: return "AES Segment (HEX)";
+    }
+}
+
+static const char*
+p2_step_title(int step) {
+    switch (step) {
+        case 0: return "Enter Phase 2 WACN (HEX)";
+        case 1: return "Enter Phase 2 SYSID (HEX)";
+        case 2: return "Enter Phase 2 NAC/CC (HEX)";
+        default: return "Enter Phase 2 value (HEX)";
+    }
+}
+
+void
+cb_hytera_step(void* u, const char* text) {
+    HyCtx* hc = (HyCtx*)u;
+    if (!hc) {
+        return;
+    }
+    unsigned long long t = 0ULL;
+    if (!text || !*text) {
+        ui_statusf("Hytera key entry canceled");
+        free(hc);
+        return;
+    }
+    if (!parse_required_hex(text, &t)) {
+        ui_statusf("Invalid HEX; expected %s", hytera_step_title(hc->step));
+        ui_prompt_open_string_async(hytera_step_title(hc->step), text, 128, cb_hytera_step, hc);
+        return;
+    }
+
+    if (hc->step == 0) {
+        hc->H = t;
+        hc->K1 = t;
+    } else if (hc->step == 1) {
+        hc->K2 = t;
+    } else if (hc->step == 2) {
+        hc->K3 = t;
+    } else if (hc->step == 3) {
+        hc->K4 = t;
+    }
+    hc->step++;
+    if (hc->step <= 3) {
+        ui_prompt_open_string_async(hytera_step_title(hc->step), NULL, 128, cb_hytera_step, hc);
+        return;
+    }
+
+    const dsd_app_hytera_key_payload p = {hc->H, hc->K1, hc->K2, hc->K3, hc->K4};
+
+    (void)dsd_app_command_set_hytera_key(&p);
+    ui_statusf("Hytera key set");
+    free(hc);
+}
+
+void
+cb_aes_step(void* u, const char* text) {
+    AesCtx* ac = (AesCtx*)u;
+    if (!ac) {
+        return;
+    }
+    unsigned long long t = 0ULL;
+    if (!text || !*text) {
+        ui_statusf("AES key entry canceled");
+        free(ac);
+        return;
+    }
+    if (!parse_required_hex(text, &t)) {
+        ui_statusf("Invalid HEX; expected %s", aes_step_title(ac->step));
+        ui_prompt_open_string_async(aes_step_title(ac->step), text, 128, cb_aes_step, ac);
+        return;
+    }
+
+    if (ac->step == 0) {
+        ac->K1 = t;
+    } else if (ac->step == 1) {
+        ac->K2 = t;
+    } else if (ac->step == 2) {
+        ac->K3 = t;
+    } else if (ac->step == 3) {
+        ac->K4 = t;
+    }
+    ac->step++;
+    if (ac->step <= 3) {
+        ui_prompt_open_string_async(aes_step_title(ac->step), NULL, 128, cb_aes_step, ac);
+        return;
+    }
+
+    const dsd_app_aes_key_payload p = {ac->K1, ac->K2, ac->K3, ac->K4};
+
+    (void)dsd_app_command_set_aes_key(&p);
+    free(ac);
+}
+
+void
+cb_p2_step(void* u, const char* text) {
+    P2Ctx* pc = (P2Ctx*)u;
+    if (!pc) {
+        return;
+    }
+    unsigned long long t = 0ULL;
+    if (!text || !*text) {
+        ui_statusf("Phase 2 parameter entry canceled");
+        free(pc);
+        return;
+    }
+    if (!parse_required_hex(text, &t)) {
+        ui_statusf("Invalid HEX; expected %s", p2_step_title(pc->step));
+        ui_prompt_open_string_async(p2_step_title(pc->step), text, 64, cb_p2_step, pc);
+        return;
+    }
+    if (pc->step == 0) {
+        pc->w = t;
+    } else if (pc->step == 1) {
+        pc->s = t;
+    } else if (pc->step == 2) {
+        pc->n = t;
+    }
+    pc->step++;
+    char pre[64];
+    if (pc->step == 1) {
+        DSD_SNPRINTF(pre, sizeof pre, "%llX",
+                     (unsigned long long)((pc->c && pc->c->state) ? pc->c->state->p2_sysid : 0ULL));
+        ui_prompt_open_string_async(p2_step_title(pc->step), pre, sizeof pre, cb_p2_step, pc);
+        return;
+    }
+    if (pc->step == 2) {
+        DSD_SNPRINTF(pre, sizeof pre, "%llX",
+                     (unsigned long long)((pc->c && pc->c->state) ? pc->c->state->p2_cc : 0ULL));
+        ui_prompt_open_string_async(p2_step_title(pc->step), pre, sizeof pre, cb_p2_step, pc);
+        return;
+    }
+
+    const dsd_app_p25_p2_params_payload p = {pc->w, pc->s, pc->n};
+
+    (void)dsd_app_command_set_p25_p2_params(&p);
+    free(pc);
+}
+
+// ---- IO callbacks ----
+
+void
+cb_io_save_symbol_capture(void* v, const char* path) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (path && *path) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_SYMCAP_OPEN, path);
+        ui_statusf("Symbol capture open requested");
+    }
+}
+
+void
+cb_io_read_symbol_bin(void* v, const char* path) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (path && *path) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_SYMBOL_IN_OPEN, path);
+        ui_statusf("Symbol input open requested");
+    }
+}
+
+void
+cb_udp_out_port(void* u, int ok, int port) {
+    UdpOutCtx* ctx = (UdpOutCtx*)u;
+    if (!ctx) {
+        return;
+    }
+    if (!ok) {
+        free(ctx);
+        return;
+    }
+    ctx->port = port;
+
+    struct {
+        char host[256];
+        int32_t port;
+    } payload = {0};
+
+    DSD_SNPRINTF(payload.host, sizeof payload.host, "%s", ctx->host);
+    payload.port = port;
+    (void)dsd_app_command_set_endpoint(DSD_APP_CMD_UDP_OUT_CFG, payload.host, payload.port);
+    ui_statusf("UDP out requested: %s:%d", ctx->host, ctx->port);
+    free(ctx);
+}
+
+void
+cb_udp_out_host(void* u, const char* host) {
+    UdpOutCtx* ctx = (UdpOutCtx*)u;
+    if (!ctx) {
+        return;
+    }
+    if (!host || !*host) {
+        free(ctx);
+        return;
+    }
+    DSD_SNPRINTF(ctx->host, sizeof ctx->host, "%s", host);
+    int port_default = ctx->c->opts->udp_portno > 0 ? ctx->c->opts->udp_portno : 23456;
+    ui_prompt_open_int_async("UDP blaster port", port_default, cb_udp_out_port, ctx);
+}
+
+void
+cb_tcp_port(void* u, int ok, int port) {
+    TcpLinkCtx* ctx = (TcpLinkCtx*)u;
+    if (!ctx) {
+        return;
+    }
+    if (!ok) {
+        free(ctx);
+        return;
+    }
+    ctx->port = port;
+
+    struct {
+        char host[256];
+        int32_t port;
+    } payload = {0};
+
+    DSD_SNPRINTF(payload.host, sizeof payload.host, "%s", ctx->host);
+    payload.port = ctx->port;
+    (void)dsd_app_command_set_endpoint(DSD_APP_CMD_TCP_CONNECT_AUDIO_CFG, payload.host, payload.port);
+    ui_statusf("TCP connect requested: %s:%d", ctx->host, ctx->port);
+    free(ctx);
+}
+
+void
+cb_tcp_host(void* u, const char* host) {
+    TcpLinkCtx* ctx = (TcpLinkCtx*)u;
+    if (!ctx) {
+        return;
+    }
+    if (!host || !*host) {
+        free(ctx);
+        return;
+    }
+    DSD_SNPRINTF(ctx->host, sizeof ctx->host, "%s", host);
+    int defp = ctx->c->opts->tcp_portno > 0 ? ctx->c->opts->tcp_portno : 7355;
+    ui_prompt_open_int_async("Enter TCP Direct Link Port Number", defp, cb_tcp_port, ctx);
+}
+
+void
+cb_udp_in_port(void* u, int ok, int port) {
+    UdpInCtx* ctx = (UdpInCtx*)u;
+    if (!ctx) {
+        return;
+    }
+    if (!ok) {
+        free(ctx);
+        return;
+    }
+    ctx->port = port;
+
+    struct {
+        char bind[256];
+        int32_t port;
+    } payload = {0};
+
+    DSD_SNPRINTF(payload.bind, sizeof payload.bind, "%s", ctx->addr);
+    payload.port = ctx->port;
+    (void)dsd_app_command_set_udp_input(payload.bind, payload.port);
+    ui_statusf("UDP input set requested: %s:%d", ctx->addr, ctx->port);
+    free(ctx);
+}
+
+void
+cb_udp_in_addr(void* u, const char* addr) {
+    UdpInCtx* ctx = (UdpInCtx*)u;
+    if (!ctx) {
+        return;
+    }
+    if (!addr || !*addr) {
+        free(ctx);
+        return;
+    }
+    DSD_SNPRINTF(ctx->addr, sizeof ctx->addr, "%s", addr);
+    int defp = ctx->c->opts->udp_in_portno > 0 ? ctx->c->opts->udp_in_portno : 7355;
+    ui_prompt_open_int_async("Enter UDP bind port", defp, cb_udp_in_port, ctx);
+}
+
+void
+cb_rig_port(void* u, int ok, int port) {
+    RigCtx* ctx = (RigCtx*)u;
+    if (!ctx) {
+        return;
+    }
+    if (!ok) {
+        free(ctx);
+        return;
+    }
+    ctx->port = port;
+
+    struct {
+        char host[256];
+        int32_t port;
+    } payload = {0};
+
+    DSD_SNPRINTF(payload.host, sizeof payload.host, "%s", ctx->host);
+    payload.port = ctx->port;
+    (void)dsd_app_command_set_endpoint(DSD_APP_CMD_RIGCTL_CONNECT_CFG, payload.host, payload.port);
+    ui_statusf("Rigctl connect requested: %s:%d", ctx->host, ctx->port);
+    free(ctx);
+}
+
+void
+cb_rig_host(void* u, const char* host) {
+    RigCtx* ctx = (RigCtx*)u;
+    if (!ctx) {
+        return;
+    }
+    if (!host || !*host) {
+        free(ctx);
+        return;
+    }
+    DSD_SNPRINTF(ctx->host, sizeof ctx->host, "%s", host);
+    int defp = ctx->c->opts->rigctlportno > 0 ? ctx->c->opts->rigctlportno : 4532;
+    ui_prompt_open_int_async("Enter RIGCTL Port Number", defp, cb_rig_port, ctx);
+}
+
+void
+cb_switch_to_wav(void* v, const char* path) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (path && *path) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_INPUT_WAV_SET, path);
+        ui_statusf("WAV input requested: %s", path);
+    }
+}
+
+void
+cb_switch_to_symbol(void* v, const char* path) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (path && *path) {
+        size_t len = strlen(path);
+        if (len >= 4 && dsd_strcasecmp(path + len - 4, ".bin") == 0) {
+            (void)dsd_app_command_set_string(DSD_APP_CMD_SYMBOL_IN_OPEN, path);
+            ui_statusf("Symbol input open requested");
+        } else {
+            (void)dsd_app_command_set_string(DSD_APP_CMD_INPUT_SYM_STREAM_SET, path);
+            ui_statusf("Symbol stream input requested");
+        }
+    }
+}
+
+// ---- Gain callbacks ----
+
+void
+cb_gain_dig(void* u, int ok, double g) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        int adjusted = 0;
+        g = clamp_double_with_notice("Digital gain", g, 0.0, 50.0, &adjusted);
+        int32_t v = (int32_t)g;
+        (void)dsd_app_command_set_i32(DSD_APP_CMD_GAIN_SET, v);
+        if (!adjusted) {
+            ui_statusf("Applying digital gain: %.1f", g);
+        }
+    }
+}
+
+void
+cb_gain_ana(void* u, int ok, double g) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        int adjusted = 0;
+        g = clamp_double_with_notice("Analog gain", g, 0.0, 100.0, &adjusted);
+        int32_t v = (int32_t)g;
+        (void)dsd_app_command_set_i32(DSD_APP_CMD_AGAIN_SET, v);
+        if (!adjusted) {
+            ui_statusf("Applying analog gain: %.1f", g);
+        }
+    }
+}
+
+void
+cb_input_vol(void* u, int ok, int m) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        int adjusted = 0;
+        m = clamp_int_with_notice("Input volume", m, 1, 16, &adjusted);
+        int32_t v = m;
+        (void)dsd_app_command_set_i32(DSD_APP_CMD_INPUT_VOL_SET, v);
+        if (!adjusted) {
+            ui_statusf("Applying input volume: %dX", m);
+        }
+    }
+}
+
+// ---- RTL callbacks ----
+
+void
+cb_rtl_dev(void* u, int ok, int i) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        int32_t v = i;
+        (void)dsd_app_command_set_i32(DSD_APP_CMD_RTL_SET_DEV, v);
+    }
+}
+
+void
+cb_rtl_freq(void* u, int ok, int f) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        int adjusted = 0;
+        f = clamp_int_with_notice("RTL frequency", f, 0, 2147483647, &adjusted);
+        uint32_t v = (uint32_t)f;
+        (void)dsd_app_command_set_u32(DSD_APP_CMD_RTL_SET_FREQ, v);
+    }
+}
+
+void
+cb_rtl_gain(void* u, int ok, int g) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        int adjusted = 0;
+        g = clamp_int_with_notice("RTL gain", g, 0, 49, &adjusted);
+        int32_t v = g;
+        (void)dsd_app_command_set_i32(DSD_APP_CMD_RTL_SET_GAIN, v);
+        if (!adjusted) {
+            ui_statusf("Applying RTL gain: %d", g);
+        }
+    }
+}
+
+void
+cb_rtl_ppm(void* u, int ok, int p) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        int adjusted = 0;
+        p = clamp_int_with_notice("RTL PPM", p, -200, 200, &adjusted);
+        int32_t v = p;
+        (void)dsd_app_command_set_i32(DSD_APP_CMD_RTL_SET_PPM, v);
+        if (!adjusted) {
+            ui_statusf("Applying RTL PPM: %d", p);
+        }
+    }
+}
+
+void
+cb_rtl_bw(void* u, int ok, int bw) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        int adjusted = 0;
+        const int allowed[] = {4, 6, 8, 12, 16, 24, 48};
+        int best = allowed[0];
+        int64_t best_dist = llabs((int64_t)bw - (int64_t)allowed[0]);
+        for (size_t i = 1; i < (sizeof allowed / sizeof allowed[0]); i++) {
+            int64_t d = llabs((int64_t)bw - (int64_t)allowed[i]);
+            if (d < best_dist) {
+                best_dist = d;
+                best = allowed[i];
+            }
+        }
+        if (best != bw) {
+            adjusted = 1;
+            ui_statusf("RTL BW adjusted to %d kHz (allowed: 4,6,8,12,16,24,48)", best);
+        }
+        bw = best;
+        int32_t v = bw;
+        (void)dsd_app_command_set_i32(DSD_APP_CMD_RTL_SET_BW, v);
+        if (!adjusted) {
+            ui_statusf("Applying RTL BW: %d kHz", bw);
+        }
+    }
+}
+
+void
+cb_rtl_sql(void* u, int ok, double dB) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        double v = dB;
+        (void)dsd_app_command_set_double(DSD_APP_CMD_RTL_SET_SQL_DB, v);
+    }
+}
+
+void
+cb_rtl_vol(void* u, int ok, int m) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        int adjusted = 0;
+        m = clamp_int_with_notice("RTL monitor gain", m, 0, 3, &adjusted);
+        int32_t v = m;
+        (void)dsd_app_command_set_i32(DSD_APP_CMD_RTL_SET_VOL_MULT, v);
+        if (!adjusted) {
+            ui_statusf("Applying RTL monitor gain: %dX", m);
+        }
+    }
+}
+
+// ---- DSP/Env callbacks ----
+
+void
+cb_input_warn(void* v, int ok, double thr) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (!ok) {
+        return;
+    }
+    int adjusted = 0;
+    thr = clamp_double_with_notice("Input warning threshold", thr, -200.0, 0.0, &adjusted);
+    (void)dsd_app_command_set_double(DSD_APP_CMD_INPUT_WARN_DB_SET, thr);
+    env_set_double("DSD_NEO_INPUT_WARN_DB", thr);
+    if (!adjusted) {
+        ui_statusf("Applying input warning threshold: %.1f dBFS", thr);
+    }
+}
+
+void
+cb_set_p25_num(void* u, int ok, double val) {
+    P25NumCtx* pc = (P25NumCtx*)u;
+    if (!pc) {
+        return;
+    }
+    if (ok) {
+        env_set_double(pc->name, val);
+    }
+    free(pc);
+}
+
+void
+cb_audio_lpf(void* v, int ok, int hz) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c || !ok) {
+        return;
+    }
+    if (hz <= 0) {
+        dsd_setenv("DSD_NEO_AUDIO_LPF", "off", 1);
+    } else {
+        env_set_int("DSD_NEO_AUDIO_LPF", hz);
+    }
+    env_reparse_runtime_cfg(c->opts);
+}
+
+void
+cb_auto_ppm_snr(void* v, int ok, double d) {
+    (void)v;
+    if (!ok) {
+        return;
+    }
+    env_set_double("DSD_NEO_AUTO_PPM_SNR_DB", d);
+}
+
+void
+cb_auto_ppm_pwr(void* v, int ok, double d) {
+    (void)v;
+    if (ok) {
+        env_set_double("DSD_NEO_AUTO_PPM_PWR_DB", d);
+    }
+}
+
+void
+cb_auto_ppm_zeroppm(void* v, int ok, double p) {
+    (void)v;
+    if (ok) {
+        env_set_double("DSD_NEO_AUTO_PPM_ZEROLOCK_PPM", p);
+    }
+}
+
+void
+cb_auto_ppm_zerohz(void* v, int ok, int h) {
+    (void)v;
+    if (ok) {
+        env_set_int("DSD_NEO_AUTO_PPM_ZEROLOCK_HZ", h);
+    }
+}
+
+void
+cb_tcp_prebuf(void* v, int ok, int ms) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!ok) {
+        return;
+    }
+    env_set_int("DSD_NEO_TCP_PREBUF_MS", ms);
+    if (c && c->opts && c->opts->audio_in_type == AUDIO_IN_RTL) {
+        (void)dsd_app_command_action(DSD_APP_CMD_RTL_RESTART);
+    }
+}
+
+void
+cb_tcp_rcvbuf(void* v, int ok, int sz) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!ok) {
+        return;
+    }
+    if (sz <= 0) {
+        dsd_setenv("DSD_NEO_TCP_RCVBUF", "", 1);
+    } else {
+        env_set_int("DSD_NEO_TCP_RCVBUF", sz);
+    }
+    if (c && c->opts && c->opts->audio_in_type == AUDIO_IN_RTL) {
+        (void)dsd_app_command_action(DSD_APP_CMD_RTL_RESTART);
+    }
+}
+
+void
+cb_tcp_rcvtimeo(void* v, int ok, int ms) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!ok) {
+        return;
+    }
+    if (ms <= 0) {
+        dsd_setenv("DSD_NEO_TCP_RCVTIMEO", "", 1);
+    } else {
+        env_set_int("DSD_NEO_TCP_RCVTIMEO", ms);
+    }
+    if (c && c->opts && c->opts->audio_in_type == AUDIO_IN_RTL) {
+        (void)dsd_app_command_action(DSD_APP_CMD_RTL_RESTART);
+    }
+}
+
+// ---- LRRP callback ----
+
+void
+cb_lr_custom(void* v, const char* path) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (path && *path) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_LRRP_SET_CUSTOM, path);
+        ui_statusf("LRRP custom output requested");
+    }
+}
+
+// ---- Env editor callbacks ----
+
+void
+cb_env_edit_value(void* u, const char* val) {
+    EnvEditCtx* ec = (EnvEditCtx*)u;
+    if (!ec) {
+        return;
+    }
+    if (!val) {
+        free(ec);
+        return;
+    }
+    if (*val) {
+        dsd_setenv(ec->name, val, 1);
+        ui_statusf("Set %s", ec->name);
+    } else {
+        dsd_unsetenv(ec->name);
+        ui_statusf("Cleared %s", ec->name);
+    }
+    // Apply to runtime config as appropriate
+    env_reparse_runtime_cfg(ec->c ? ec->c->opts : NULL);
+    free(ec);
+}
+
+void
+cb_env_edit_name(void* u, const char* name) {
+    EnvEditCtx* ec = (EnvEditCtx*)u;
+    if (!ec) {
+        return;
+    }
+    if (!name || !*name) {
+        free(ec);
+        return;
+    }
+    // Require DSD_NEO_ prefix for safety
+    if (dsd_strncasecmp(name, "DSD_NEO_", 8) != 0) {
+        ui_statusf("Variable name must start with DSD_NEO_");
+        free(ec);
+        return;
+    }
+    DSD_SNPRINTF(ec->name, sizeof ec->name, "%s", name);
+    const char* cur = dsd_neo_env_get(ec->name);
+    ui_prompt_open_string_async("Enter value (empty to clear)", cur ? cur : "", 256, cb_env_edit_value, ec);
+}
+
+// ---- M17 callback ----
+
+void
+cb_m17_user_data(void* u, const char* text) {
+    M17Ctx* mc = (M17Ctx*)u;
+    if (mc && mc->c && text && *text) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_M17_USER_DATA_SET, text);
+        ui_statusf("M17 user data set requested");
+    }
+    free(mc);
+}
+
+// ---- Chooser completion handlers ----
+
+static void
+chooser_free_lists(const char** names, char** bufs, int n, const char** labels) {
+    if (names) {
+        for (int i = 0; i < n; i++) {
+            free((void*)names[i]);
+        }
+    }
+    if (bufs) {
+        for (int i = 0; i < n; i++) {
+            free(bufs[i]);
+        }
+    }
+    free((void*)labels);
+    free((void*)names);
+    free((void*)bufs);
+}
+
+void
+chooser_done_pulse_out(void* u, int sel) {
+    PulseSelCtx* pc = (PulseSelCtx*)u;
+    if (pc) {
+        if (sel >= 0 && sel < pc->n) {
+            const char* name = pc->names[sel];
+            (void)dsd_app_command_set_string(DSD_APP_CMD_PULSE_OUT_SET, name);
+            ui_statusf("Pulse out requested: %s", name);
+        }
+        chooser_free_lists(pc->names, pc->bufs, pc->n, pc->labels);
+        free(pc);
+    }
+}
+
+void
+chooser_done_pulse_in(void* u, int sel) {
+    PulseSelCtx* pc = (PulseSelCtx*)u;
+    if (pc) {
+        if (sel >= 0 && sel < pc->n) {
+            const char* name = pc->names[sel];
+            (void)dsd_app_command_set_string(DSD_APP_CMD_PULSE_IN_SET, name);
+            ui_statusf("Pulse in requested: %s", name);
+        }
+        chooser_free_lists(pc->names, pc->bufs, pc->n, pc->labels);
+        free(pc);
+    }
+}

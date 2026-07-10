@@ -1,0 +1,113 @@
+name: scorecard
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: "37 5 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  checks: read
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  wait-for-linux-ci:
+    name: Wait for Linux CI
+    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Wait for Linux CI checks
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 2700))
+
+          while true; do
+            run_state="$(
+              gh run list \
+                --repo "$GH_REPO" \
+                --workflow linux-ci.yaml \
+                --commit "$HEAD_SHA" \
+                --event push \
+                --limit 1 \
+                --json status,conclusion \
+                --jq '.[0] // empty | [.status, (.conclusion // "")] | @tsv'
+            )"
+
+            if [ -n "$run_state" ]; then
+              IFS=$'\t' read -r status conclusion <<< "$run_state"
+              if [ "$status" = completed ]; then
+                if [ "$conclusion" = success ]; then
+                  echo "linux-ci completed with conclusion: success"
+                  break
+                fi
+                echo "linux-ci completed with non-success conclusion: ${conclusion:-unknown}" >&2
+                exit 1
+              fi
+              echo "linux-ci is $status; waiting before Scorecard..."
+            else
+              echo "linux-ci push run for $HEAD_SHA is not visible yet; waiting..."
+            fi
+
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "Timed out waiting for linux-ci to complete for $HEAD_SHA" >&2
+              exit 1
+            fi
+
+            sleep 30
+          done
+
+  scorecard:
+    name: OpenSSF Scorecard
+    needs: [wait-for-linux-ci]
+    if: >-
+      always() &&
+      github.ref_name == github.event.repository.default_branch &&
+      (github.event_name != 'push' || needs.wait-for-linux-ci.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      checks: read
+      contents: read
+      issues: read
+      id-token: write
+      pull-requests: read
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard
+        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload Scorecard SARIF
+        if: always() && hashFiles('scorecard.sarif') != ''
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          sarif_file: scorecard.sarif
+
+      - name: Upload Scorecard output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scorecard-report
+          path: scorecard.sarif
+          include-hidden-files: true
+          retention-days: 7
