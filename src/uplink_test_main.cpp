@@ -96,6 +96,8 @@ struct RxSource {
     bool        selftest = false;  // modulate known TSBKs -> decode (no RF)
     int         ssInterval = 35;   // OSP status symbol interval (frame dibits)
     int         mixHz = 0;         // baseband downconvert for off-centre IQ
+    double      gardner = 0.00015; // Gardner timing loop gain
+    int         fswDist = 8;       // max FSW Hamming distance to accept
     bool        rtlNative = false; // capture via librtlsdr directly (proven path)
     int         rtlOffsetHz = 0;   // tune offset to dodge RTL DC spike
 };
@@ -239,7 +241,10 @@ ParseResult parseArgs(int argc, char** argv, SiteConfig& cfg, RxSource& rx)
             if (!value) return ParseResult::Error;
             rx.ssInterval = std::stoi(value);
             continue;
-        }    if (arg == "--mix") { const char* value = requireValue("--mix"); if (!value) return ParseResult::Error; rx.mixHz = std::stoi(value); continue; }
+        }
+        if (arg == "--mix") { const char* value = requireValue("--mix"); if (!value) return ParseResult::Error; rx.mixHz = std::stoi(value); continue; }
+        if (arg == "--gardner") { const char* value = requireValue("--gardner"); if (!value) return ParseResult::Error; rx.gardner = std::stod(value); continue; }
+        if (arg == "--fswdist") { const char* value = requireValue("--fswdist"); if (!value) return ParseResult::Error; rx.fswDist = std::stoi(value); continue; }
 
         if (arg == "--rtl-native") {
             rx.rtlNative = true;
@@ -288,6 +293,8 @@ int runOfflineIq(const RxSource& rx)
     recv.configure(double(rx.iqRate), 0);
     recv.setSsInterval(rx.ssInterval);
     recv.setMixOffset(double(rx.mixHz));
+    recv.setGardnerGain(rx.gardner);
+    recv.setFswMaxDist(rx.fswDist);
     uint64_t count = 0;
     recv.setTsbkCallback([&](const std::array<uint8_t, 12>& t) {
         char line[200];
@@ -365,6 +372,8 @@ int runNativeLive(const RxSource& rx, const SiteConfig& cfg)
     recv.configure(double(rate), cfg.nac);
     recv.setSsInterval(rx.ssInterval);
     recv.setInvert(rx.invert);
+    recv.setGardnerGain(rx.gardner);
+    recv.setFswMaxDist(rx.fswDist);
     recv.setMixOffset(double(rx.rtlOffsetHz));
     uint64_t count = 0;
     recv.setTsbkCallback([&](const std::array<uint8_t, 12>& t) {
@@ -497,6 +506,8 @@ int runNativeRtl(const RxSource& rx, const SiteConfig& cfg)
     recv.configure(double(rate), cfg.nac);
     recv.setSsInterval(rx.ssInterval);
     recv.setInvert(rx.invert);
+    recv.setGardnerGain(rx.gardner);
+    recv.setFswMaxDist(rx.fswDist);
     recv.setMixOffset(double(rx.rtlOffsetHz));
     uint64_t cnt = 0;
     recv.setTsbkCallback([&](const std::array<uint8_t, 12>& t) {
@@ -686,6 +697,7 @@ int main(int argc, char** argv)
     txDummy.stopTx();
     return 0;
 }
+
 
 
 

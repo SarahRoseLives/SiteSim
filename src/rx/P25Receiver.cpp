@@ -49,6 +49,37 @@ bool P25Receiver::configure(double sampleRateHz, uint16_t nac)
     m_nac        = nac;
     // Normalize the discriminator at the demod rate so outer symbol -> +/-3.
     m_fmScale = float(3.0 * m_demodRate / (2.0 * M_PI * 1800.0));
+
+    // Windowed-sinc low-pass for the decimation stage (anti-alias).
+    m_firLen = std::max(31, 12 * m_decim);
+    if ((m_firLen & 1) == 0) ++m_firLen;
+    m_firTaps.assign(m_firLen, 0.0f);
+    const double fc = 0.42 / double(m_decim);      // cutoff just below output Nyquist
+    const double center = (m_firLen - 1) / 2.0;
+    double sum = 0.0;
+    for (int i = 0; i < m_firLen; ++i) {
+        double n = double(i) - center;
+        double s = (n == 0.0) ? 1.0 : std::sin(2.0 * M_PI * fc * n) / (2.0 * M_PI * fc * n);
+        double w = 0.5 - 0.5 * std::cos(2.0 * M_PI * i / double(m_firLen - 1));  // Hann
+        m_firTaps[i] = float(2.0 * fc * s * w);
+        sum += m_firTaps[i];
+    }
+    if (sum != 0.0) for (auto& t : m_firTaps) t = float(double(t) / sum);
+    m_firI.assign(m_firLen, 0.0f);
+    m_firQ.assign(m_firLen, 0.0f);
+    m_firPos = 0;
+
+    // Precompute the FSW symbol template (+/-3, +/-1 base polarity) for direct
+    // correlation-based sync detection.
+    static const float kSymOfDibit[4] = {1.0f, 3.0f, -1.0f, -3.0f};
+    double tn = 0.0;
+    for (int k = 0; k < 24; ++k) {
+        uint8_t db = uint8_t((p25::kFrameSync >> (46 - 2 * k)) & 0x3u);
+        m_fswTmpl[k] = kSymOfDibit[db & 3];
+        tn += double(m_fswTmpl[k]) * m_fswTmpl[k];
+    }
+    m_fswTmplNorm = std::sqrt(tn) + 1e-9;
+
     reset();
     return true;
 }
@@ -64,9 +95,10 @@ void P25Receiver::reset()
     m_spsEst   = m_sps;
     m_fswWin   = 0;
     m_state    = State::Hunt;
-    m_frameIdx = 0;
-    m_skipSS   = false;
+    m_fswStartPos = 0.0;
     m_dc       = 0.0f;
+    m_nf       = 0.0;
+    m_symSqAvg = 16.0;
     m_dataDibits.fill(0);
     m_frameBuf.fill(0);
     m_fmHist.clear();
@@ -108,7 +140,12 @@ float P25Receiver::integrateDump(double pos) const
     if (i1 > last) i1 = last;
     if (i1 <= i0) return interpAt(pos);
     double sum = 0.0;
-    for (long i = i0; i <= i1; ++i) sum += m_fmHist[size_t(i - long(m_fmBase))];
+    for (long i = i0; i <= i1; ++i) {
+        double v = m_fmHist[size_t(i - long(m_fmBase))];
+        if (v > 9.0)  v = 9.0;      // reject +/-pi wrap spikes
+        if (v < -9.0) v = -9.0;
+        sum += v;
+    }
     return float(sum / double(i1 - i0 + 1));
 }
 
@@ -149,40 +186,50 @@ void P25Receiver::process(const float* iq, size_t n)
         m_fmHist.push_back((fm - m_dc) * m_fmScale);
     }
 
-    // Symbol timing recovery (Gardner) at fractional samples/symbol.
-    const double half = 0.5;
-    long long guard = 0;
-    while (true) {
-        if (++guard > (1LL << 26)) break;
-        if (!std::isfinite(m_nextPos) || !std::isfinite(m_spsEst) || m_spsEst <= 0.0) {
-            m_spsEst = m_sps;
-            m_nextPos = double(m_fmBase + m_fmHist.size());
-            break;
+    // Direct FSW correlation detection. Slide over the FM stream at the symbol
+    // rate; a normalized correlation of the 24-symbol sync template above the
+    // threshold means the sync word starts here. Scale-invariant (works for any
+    // signal level) and polarity-agnostic (|score| picks up inverted IQ too).
+    if (m_state == State::Hunt) {
+        const double sps = m_sps;
+        const double end = double(m_fmBase + m_fmHist.size());
+        while (m_nextPos + 24.0 * sps + 1.0 < end) {
+            double p = m_nextPos;
+            double corr = 0.0, en = 0.0;
+            for (int k = 0; k < 24; ++k) {
+                float s = interpAt(p + k * sps);
+                corr += double(s) * double(m_fswTmpl[k]);
+                en   += double(s) * s;
+            }
+            m_stats.symbols++;
+            if (en > 1e-9) {
+                double norm = corr / (std::sqrt(en) * m_fswTmplNorm);
+                if (std::fabs(norm) > 0.75) {
+                    m_invert = (norm < 0.0);
+                    m_stats.fswHits++;
+                    m_fswStartPos = p;
+                    m_state = State::WaitLock;
+                    break;
+                }
+            }
+            m_nextPos += 0.5;                 // half-sample search step
         }
-        double pos    = m_nextPos;
-        double midPos = pos - m_spsEst * half;
-        if (pos + 1.0 >= double(m_fmBase + m_fmHist.size())) break;      // need future sample
-        if (midPos >= 0.0 && midPos + 1.0 < double(m_fmBase)) break;
-
-        float cur = interpAt(pos);
-        float mid = interpAt(midPos);
-
-        if (m_haveSym) {
-            float e = mid * (cur - m_symPrev);      // Gardner error
-            m_spsEst += 0.00015 * e;
-            if (m_spsEst < m_sps * 0.995) m_spsEst = m_sps * 0.995;
-            if (m_spsEst > m_sps * 1.005) m_spsEst = m_sps * 1.005;
+        if (m_state == State::Hunt && m_nextPos + 24.0 * sps + 1.0 >= end) {
+            // Not enough future samples: park at the last usable position.
+            double limit = end - 24.0 * sps - 1.0;
+            if (limit > m_nextPos) m_nextPos = limit;
         }
-        m_symPrev = cur;
-        m_haveSym = true;
-
-        sliceSymbol(cur);
-        m_stats.symbols++;
-        m_nextPos += m_spsEst;
     }
 
-    // Trim consumed history, keeping a margin behind the next symbol.
-    size_t keepFromPos = (m_nextPos > m_sps * 4.0) ? size_t(m_nextPos - m_sps * 4.0) : 0;
+    // Once a sync word is detected, wait until the whole frame is buffered, then
+    // lock timing by FSW correlation and resample the frame.
+    if (m_state == State::WaitLock) tryExtract();
+
+    // Trim consumed history, keeping a margin behind the read cursor (and behind
+    // a pending sync word while waiting for the rest of the frame).
+    double keepAt = m_nextPos;
+    if (m_state == State::WaitLock) keepAt = std::min(keepAt, m_fswStartPos);
+    size_t keepFromPos = (keepAt > m_sps * 4.0) ? size_t(keepAt - m_sps * 4.0) : 0;
     if (keepFromPos > m_fmBase && keepFromPos - m_fmBase > 4096 &&
         keepFromPos - m_fmBase <= m_fmHist.size()) {
         size_t drop = keepFromPos - m_fmBase;
@@ -191,11 +238,21 @@ void P25Receiver::process(const float* iq, size_t n)
     }
 }
 
+uint8_t P25Receiver::sliceValue(float sym, float th)
+{
+    // Adaptive 4-level slice. `th` is the inner/outer boundary (midway between
+    // the inner and outer symbol magnitudes); derived from the running symbol
+    // power so it tracks the real signal levels regardless of deviation.
+    uint8_t d;
+    if (sym > th)         d = 0x1;  // outer +  (01)
+    else if (sym >= 0.0f) d = 0x0;  // inner +  (00)
+    else if (sym >= -th)  d = 0x2;  // inner -  (10)
+    else                  d = 0x3;  // outer -  (11)
+    return d;
+}
+
 void P25Receiver::sliceSymbol(float sym)
 {
-    // sym is already normalized (outer ~ +/-3, inner ~ +/-1) via m_fmScale.
-    float v = sym;
-
     if (sym < m_stats.symMin) m_stats.symMin = sym;
     if (sym > m_stats.symMax) m_stats.symMax = sym;
     {
@@ -205,12 +262,11 @@ void P25Receiver::sliceSymbol(float sym)
         m_stats.symHist[b]++;
     }
 
-    uint8_t d;
-    if (v > 2.0f)        d = 0x1;  // +3 -> 01
-    else if (v >= 0.0f)  d = 0x0;  // +1 -> 00
-    else if (v >= -2.0f) d = 0x2;  // -1 -> 10
-    else                 d = 0x3;  // -3 -> 11
-
+    // Fixed slice boundary at the midpoint between inner and outer levels for
+    // the received (real) signal; the FSW-locked integrate-and-dump extraction
+    // below provides the noise rejection.
+    (void)m_symSqAvg;
+    uint8_t d = sliceValue(sym, 2.0f);
     if (m_invert) d ^= 0x2;
     m_stats.dibitCount[d & 3]++;
     pushDibit(d);
@@ -219,38 +275,90 @@ void P25Receiver::sliceSymbol(float sym)
 void P25Receiver::pushDibit(uint8_t d)
 {
     d &= 0x3;
+    if (m_state != State::Hunt) return;
 
-    switch (m_state) {
-    case State::Hunt: {
-        m_fswWin = ((m_fswWin << 2) | d) & 0xFFFFFFFFFFFFull;
-        uint64_t fsw = p25::kFrameSync & 0xFFFFFFFFFFFFull;
-        int dist = popcount64(m_fswWin ^ fsw);
-        if (dist < m_stats.minFswDist) m_stats.minFswDist = dist;
-        int distInv = popcount64(m_fswWin ^ (fsw ^ 0xAAAAAAAAAAAAull));
-        if (distInv < m_stats.minFswDistInv) m_stats.minFswDistInv = distInv;
-        if (dist <= 8) {
-            // FSW = frame dibits 1..24 (the first status symbol comes only after
-            // frame dibit 35), so the 24 dibits just seen are frame 1..24.
-            m_stats.fswHits++;
-            m_state    = State::Frame;
-            m_frameIdx = 24;
-            m_skipSS   = false;
+    m_fswWin = ((m_fswWin << 2) | d) & 0xFFFFFFFFFFFFull;
+    const uint64_t fsw = p25::kFrameSync & 0xFFFFFFFFFFFFull;
+    int dist = popcount64(m_fswWin ^ fsw);
+    if (dist < m_stats.minFswDist) m_stats.minFswDist = dist;
+    int distInv = popcount64(m_fswWin ^ (fsw ^ 0xAAAAAAAAAAAAull));
+    if (distInv < m_stats.minFswDistInv) m_stats.minFswDistInv = distInv;
+    if (dist <= m_fswMaxDist) {
+        // The 24 dibits just sliced are FSW symbols 1..24; the last one is at
+        // m_nextPos, so symbol 1 is 23 symbols earlier.
+        m_stats.fswHits++;
+        m_fswStartPos = m_nextPos - 23.0 * m_spsEst;
+        m_state = State::WaitLock;
+    }
+}
+
+void P25Receiver::tryExtract()
+{
+    const double sps = m_sps;
+    // Need samples through frame dibit 154's on-air position (158) + margin.
+    const double endAbs = m_fswStartPos + 159.0 * sps + 4.0;
+    if (double(m_fmBase + m_fmHist.size()) < endAbs) return;  // still waiting
+
+    // Expected FSW symbol values (frame dibits 1..24 -> +/-1/3), polarity-aware.
+    float tmpl[24];
+    double tmplEnergy = 0.0;
+    static const float kSymOfDibit[4] = {1.0f, 3.0f, -1.0f, -3.0f};
+    for (int k = 0; k < 24; ++k) {
+        uint8_t dibit = uint8_t((p25::kFrameSync >> (46 - 2 * k)) & 0x3u);
+        float v = kSymOfDibit[dibit & 3];
+        if (m_invert) v = -v;
+        tmpl[k] = v;
+        tmplEnergy += double(v) * v;
+    }
+    const double tmplNorm = std::sqrt(tmplEnergy) + 1e-9;
+
+    // Correlate the template against the buffered FM over a window around the
+    // detected position to find the exact sub-sample symbol phase.
+    double bestPos = m_fswStartPos;
+    double bestScore = -1e30;
+    const double lo = m_fswStartPos - 1.25 * sps;
+    const double hi = m_fswStartPos + 1.25 * sps;
+    for (double p = lo; p <= hi; p += 0.25) {
+        if (p < double(m_fmBase)) continue;
+        if (p + 23.0 * sps + 1.0 >= double(m_fmBase + m_fmHist.size())) continue;
+        double sc = 0.0, en = 0.0;
+        for (int k = 0; k < 24; ++k) {
+            float s = interpAt(p + k * sps);
+            sc += double(s) * tmpl[k];
+            en += double(s) * s;
         }
-        break;
+        if (en <= 1e-9) continue;
+        double norm = sc / (std::sqrt(en) * tmplNorm);
+        if (norm > bestScore) { bestScore = norm; bestPos = p; }
     }
-    case State::Frame: {
-        // insertStatusSymbols() inserts one status symbol after every 35th
-        // FRAME dibit (across the whole frame, so one lands inside the NID too).
-        if (m_skipSS) { m_skipSS = false; break; }
-        ++m_frameIdx;                                // frame dibit 25..154
-        if (m_frameIdx <= 154) {
-            m_frameBuf[m_frameIdx - 25] = d;         // buffer 0..129
-            if (m_frameIdx % m_ssInterval == 0) m_skipSS = true;
-            if (m_frameIdx == 154) processFrame();
-        }
-        break;
+
+    if (bestScore < 0.35) {
+        // Not a genuine sync (spurious match); resume hunting past this region.
+        m_nextPos = m_fswStartPos + 158.0 * sps;
+        m_state = State::Hunt;
+        m_fswWin = 0;
+        return;
     }
+
+    // Frame dibit j sits at on-air symbol j + floor((j-1)/ss); resample it there.
+    // Integrate over the symbol (matched filter) for noise rejection rather than
+    // sampling a single point; with FSW-locked timing this is stable.
+    const int ss = (m_ssInterval > 0) ? m_ssInterval : 0;
+    for (int j = 25; j <= 154; ++j) {
+        int oa = (ss > 0) ? (j + (j - 1) / ss) : j;   // 1-based on-air symbol index
+        float s = integrateDump(bestPos + double(oa - 1) * sps);
+        uint8_t d = sliceValue(s, 2.0f);
+        if (m_invert) d ^= 0x2;
+        m_frameBuf[j - 25] = d;
     }
+    processFrame();
+
+    // Resume hunting past the last on-air symbol of this frame.
+    m_nextPos = bestPos + 158.0 * sps + sps;
+    m_symPrev = 0.0f;
+    m_haveSym = false;
+    m_state = State::Hunt;
+    m_fswWin = 0;
 }
 
 void P25Receiver::processFrame()

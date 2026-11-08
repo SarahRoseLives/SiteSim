@@ -551,7 +551,12 @@ void RxPipeline::nativeSoapyThread(RxPipeline* self)
         stream = dev->setupStream(SOAPY_SDR_RX, "CF32");
         if (!stream) throw std::runtime_error("setupStream failed");
         dev->activateStream(stream);
-        diag("Soapy RX active");
+        char rb[160];
+        double actRate = double(self->m_nativeRate);
+        try { actRate = dev->getSampleRate(SOAPY_SDR_RX, 0); } catch (...) {}
+        snprintf(rb, sizeof(rb), "Soapy RX active req=%.0f actual=%.0f center=%.4f MHz off=%ld",
+                 double(self->m_nativeRate), actRate, double(center) / 1e6, self->m_nativeOffsetHz);
+        diag(rb);
     } catch (const std::exception& e) {
         diag(std::string("Soapy RX setup failed: ") + e.what());
         if (stream) dev->closeStream(stream);
@@ -559,6 +564,12 @@ void RxPipeline::nativeSoapyThread(RxPipeline* self)
         self->m_running.store(false);
         return;
     }
+
+    // Optional raw IQ dump for offline analysis: set SITESIM_RX_RECORD=<path>.
+    FILE* rec = nullptr;
+    if (const char* recp = std::getenv("SITESIM_RX_RECORD"))
+        rec = fopen(recp, "wb");
+    if (rec) diag(std::string("Soapy RX recording to ") + std::getenv("SITESIM_RX_RECORD"));
 
     std::vector<std::complex<float>> buff(16384);
     std::vector<float> f;
@@ -577,19 +588,24 @@ void RxPipeline::nativeSoapyThread(RxPipeline* self)
                 ++rmsN;
             }
             self->m_rx->process(f.data(), size_t(n));
+            if (rec) { fwrite(f.data(), sizeof(float), f.size(), rec); fflush(rec); }
             if (++chunks >= 200 && rmsN) {
-                char b[96];
-                snprintf(b, sizeof(b), "rx rms=%.4f syms=%llu fsw=%llu nid=%llu tsbk=%llu",
+                char b[160];
+                const auto& st = self->m_rx->stats();
+                snprintf(b, sizeof(b),
+                         "rx rms=%.4f syms=%llu fsw=%llu nid=%llu tsbk=%llu fswD=%d invD=%d smin=%.1f smax=%.1f",
                          std::sqrt(rmsAcc / double(rmsN)),
-                         (unsigned long long)self->m_rx->stats().symbols,
-                         (unsigned long long)self->m_rx->stats().fswHits,
-                         (unsigned long long)self->m_rx->stats().nidOk,
-                         (unsigned long long)self->m_rx->stats().tsbks);
+                         (unsigned long long)st.symbols,
+                         (unsigned long long)st.fswHits,
+                         (unsigned long long)st.nidOk,
+                         (unsigned long long)st.tsbks,
+                         st.minFswDist, st.minFswDistInv, st.symMin, st.symMax);
                 diag(b);
                 chunks = 0; rmsAcc = 0; rmsN = 0;
             }
         }
     }
+    if (rec) fclose(rec);
     dev->deactivateStream(stream);
     dev->closeStream(stream);
     if (own) SoapySDR::Device::unmake(dev);
