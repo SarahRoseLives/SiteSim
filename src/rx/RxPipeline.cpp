@@ -363,7 +363,12 @@ void RxPipeline::handleIspTsbk(uint8_t opcode, const uint8_t raw12[12])
             m_cfg.vChanNum,
             static_cast<uint16_t>(tgid),
             src_id);
-        m_cc.queueTSBK(grant);
+        // Emit the grant many times so it is on the air continuously across the
+        // subscriber's request/retry window. A single grant often missed the
+        // radio's short listen window (~6 s bonk or no permit); a burst lets it
+        // catch one immediately. The producer drains one queued TSBK per frame.
+        for (int i = 0; i < 10; ++i)
+            m_cc.queueTSBK(grant);
 
         snprintf(buf, sizeof(buf),
                  "GRP_VCH_REQ  SRC:%-8u TGID:%-5u%s -> granted VC %.5f MHz (IDEN %u ch %u)",
@@ -624,6 +629,14 @@ void RxPipeline::feedDecoderBytes(const char* data, int n)
             clean.push_back(m_lineBuf[j]);
         }
         m_lineBuf.clear();
+
+        if (g_rx_logfile &&
+            (clean.find("Sync:") != std::string::npos || clean.find("NAC") != std::string::npos ||
+             clean.find("RF Level") != std::string::npos || clean.find("RTL") != std::string::npos ||
+             clean.find("Starting RTL") != std::string::npos || clean.find("Found") != std::string::npos)) {
+            fprintf(g_rx_logfile, "DBG: %s\n", clean.c_str());
+            fflush(g_rx_logfile);
+        }
 
         if (clean.find("PDU Payload") != std::string::npos) {
             m_expectPdu = true;

@@ -47,7 +47,7 @@ set(SITESIM_SOURCES
     src/p25/C4FM.cpp
     src/tx/SoapyTx.cpp
     src/tx/ControlChannel.cpp
-    src/rx/RxPipeline.cpp
+    src/rx/RxPipeline.cpp    src/rx/P25Receiver.cpp
     src/ui/App.cpp
     src/ui/SitePanel.cpp
     src/ui/CCPanel.cpp
@@ -63,7 +63,7 @@ set(SITESIM_CORE_SOURCES
     src/p25/C4FM.cpp
     src/tx/SoapyTx.cpp
     src/tx/ControlChannel.cpp
-    src/rx/RxPipeline.cpp
+    src/rx/RxPipeline.cpp    src/rx/P25Receiver.cpp
 )
 
 add_executable(uplink_test

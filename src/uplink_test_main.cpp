@@ -1,4 +1,16 @@
 #include "rx/RxPipeline.hpp"
+#include "rx/P25Receiver.hpp"
+
+#include <cstdio>
+#include <cstring>
+#include <complex>
+#include <fstream>
+#include <iterator>
+#include <stdexcept>
+#include <vector>
+
+#include <SoapySDR/Device.hpp>
+#include <SoapySDR/Formats.hpp>
 
 #ifdef SITESIM_HAVE_DSDNEO
 #include <dsd-neo/core/input_level.h>
@@ -64,6 +76,19 @@ struct RxSource {
     bool        keyTx        = false;
     double      txGainDb     = 60.0;
     int         durationSec  = 0;
+
+    // Offline IQ decode (no SDR hardware needed).
+    std::string iqPath;
+    uint32_t    iqRate   = 250000;
+    bool        iqRaw    = false;   // raw cu8, no WAV header
+    int         iqOffset = -1;      // data offset override (-1 = auto)
+
+    // Native (in-process) P25Receiver live decode via SoapySDR RX.
+    bool        native   = false;
+    double      rxGainDb = 20.0;
+    bool        invert   = false;
+    std::string recordPath;      // write raw CF32 IQ instead of/while decoding
+    bool        iqCf32   = false;  // offline reader: file is raw float32 I/Q
 };
 
 ParseResult parseArgs(int argc, char** argv, SiteConfig& cfg, RxSource& rx)
@@ -156,6 +181,46 @@ ParseResult parseArgs(int argc, char** argv, SiteConfig& cfg, RxSource& rx)
             rx.durationSec = std::stoi(value);
             continue;
         }
+        if (arg == "--iq") {
+            const char* value = requireValue("--iq");
+            if (!value) return ParseResult::Error;
+            rx.iqPath = value;
+            continue;
+        }
+        if (arg == "--iq-rate") {
+            const char* value = requireValue("--iq-rate");
+            if (!value) return ParseResult::Error;
+            rx.iqRate = static_cast<uint32_t>(std::stoul(value));
+            continue;
+        }
+        if (arg == "--iq-raw") {
+            rx.iqRaw = true;
+            continue;
+        }
+        if (arg == "--native") {
+            rx.native = true;
+            continue;
+        }
+        if (arg == "--invert") {
+            rx.invert = true;
+            continue;
+        }
+        if (arg == "--rx-gain") {
+            const char* value = requireValue("--rx-gain");
+            if (!value) return ParseResult::Error;
+            rx.rxGainDb = std::stod(value);
+            continue;
+        }
+        if (arg == "--record") {
+            const char* value = requireValue("--record");
+            if (!value) return ParseResult::Error;
+            rx.recordPath = value;
+            continue;
+        }
+        if (arg == "--iq-cf32") {
+            rx.iqCf32 = true;
+            continue;
+        }
 
         std::cerr << "Unknown option: " << arg << "\n";
         printUsage(argv[0]);
@@ -163,6 +228,157 @@ ParseResult parseArgs(int argc, char** argv, SiteConfig& cfg, RxSource& rx)
     }
 
     return ParseResult::Ok;
+}
+
+int runOfflineIq(const RxSource& rx)
+{
+    std::ifstream f(rx.iqPath, std::ios::binary);
+    if (!f) { std::cerr << "Cannot open " << rx.iqPath << "\n"; return 1; }
+    std::vector<uint8_t> raw((std::istreambuf_iterator<char>(f)),
+                             std::istreambuf_iterator<char>());
+    if (raw.size() < 8) { std::cerr << "file too small\n"; return 1; }
+
+    size_t off = 0;
+    if (!rx.iqRaw && !rx.iqCf32) {
+        if (raw.size() > 12 && std::memcmp(raw.data(), "RIFF", 4) == 0) {
+            for (size_t i = 12; i + 8 < raw.size() && i < 256; ++i) {
+                if (std::memcmp(raw.data() + i, "data", 4) == 0) { off = i + 8; break; }
+            }
+        } else {
+            off = 44;
+        }
+    }
+    if (off >= raw.size()) off = 0;
+
+    std::cout << "Offline IQ decode: " << rx.iqPath
+              << "  rate=" << rx.iqRate << " Hz  dataOffset=" << off
+              << "  bytes=" << raw.size() << "\n";
+
+    p25rx::P25Receiver recv;
+    recv.configure(double(rx.iqRate), 0);
+    uint64_t count = 0;
+    recv.setTsbkCallback([&](const std::array<uint8_t, 12>& t) {
+        char line[200];
+        std::snprintf(line, sizeof(line),
+                      "TSBK op=0x%02X raw=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                      t[0] & 0x3F, t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7],
+                      t[8], t[9], t[10], t[11]);
+        std::cout << line << "\n";
+        ++count;
+    });
+
+    std::vector<float> buf;
+    buf.reserve(8192);
+    if (rx.iqCf32) {
+        const size_t nf = (raw.size() - off) / sizeof(float);
+        const float* f = reinterpret_cast<const float*>(raw.data() + off);
+        for (size_t k = 0; k < nf; ++k) {
+            buf.push_back(f[k]);
+            if (buf.size() >= 8192) { recv.process(buf.data(), buf.size() / 2); buf.clear(); }
+        }
+    } else {
+        for (size_t i = 0; i + 1 < raw.size() - off; i += 2) {
+            buf.push_back((float(raw[off + i])     - 127.5f) / 127.5f);
+            buf.push_back((float(raw[off + i + 1]) - 127.5f) / 127.5f);
+            if (buf.size() >= 8192) { recv.process(buf.data(), buf.size() / 2); buf.clear(); }
+        }
+    }
+    if (!buf.empty()) recv.process(buf.data(), buf.size() / 2);
+
+    auto& s = recv.stats();
+    std::cout << "samples=" << s.samples << " symbols=" << s.symbols
+              << " fswHits=" << s.fswHits << " nidOk=" << s.nidOk
+              << " framesTried=" << s.framesTried << " crcOk=" << s.crcOk
+              << " tsbks=" << s.tsbks << "\n";
+    std::cout << "minFswDist=" << s.minFswDist << " minFswDistInv=" << s.minFswDistInv
+              << " dibits[" << s.dibitCount[0] << "," << s.dibitCount[1]
+              << "," << s.dibitCount[2] << "," << s.dibitCount[3] << "]\n";
+    return count ? 0 : 2;
+}
+
+int runNativeLive(const RxSource& rx, const SiteConfig& cfg)
+{
+    std::string args = rx.soapyArgs.empty() ? "driver=rtlsdr" : rx.soapyArgs;
+    uint32_t rate = rx.sampleRateHz ? rx.sampleRateHz : 1536000;
+    double freq = cfg.rxFreqHz();
+
+    SoapySDR::Device* dev = nullptr;
+    try { dev = SoapySDR::Device::make(args); }
+    catch (const std::exception& e) { std::cerr << "Soapy make failed: " << e.what() << "\n"; return 1; }
+    if (!dev) { std::cerr << "No Soapy device\n"; return 1; }
+
+    SoapySDR::Stream* stream = nullptr;
+    try {
+        dev->setSampleRate(SOAPY_SDR_RX, 0, double(rate));
+        dev->setFrequency(SOAPY_SDR_RX, 0, freq);
+        try { dev->setGain(SOAPY_SDR_RX, 0, rx.rxGainDb); } catch (...) {}
+        try { dev->setBandwidth(SOAPY_SDR_RX, 0, double(rate)); } catch (...) {}
+        stream = dev->setupStream(SOAPY_SDR_RX, "CF32");
+        if (!stream) throw std::runtime_error("setupStream failed");
+        dev->activateStream(stream);
+    } catch (const std::exception& e) {
+        std::cerr << "Soapy RX config failed: " << e.what() << "\n";
+        SoapySDR::Device::unmake(dev);
+        return 1;
+    }
+
+    p25rx::P25Receiver recv;
+    recv.configure(double(rate), cfg.nac);
+    recv.setInvert(rx.invert);
+    uint64_t count = 0;
+    recv.setTsbkCallback([&](const std::array<uint8_t, 12>& t) {
+        char line[200];
+        std::snprintf(line, sizeof(line),
+                      "TSBK op=0x%02X raw=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                      t[0] & 0x3F, t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7],
+                      t[8], t[9], t[10], t[11]);
+        std::cout << line << "\n" << std::flush;
+        ++count;
+    });
+
+    std::cout << "Native P25Receiver RX on " << std::fixed << std::setprecision(4)
+              << (freq / 1e6) << " MHz  rate=" << rate << "  args=" << args
+              << "  gain=" << rx.rxGainDb << "\n" << std::flush;
+
+    std::vector<std::complex<float>> buff(16384);
+    std::vector<float> inter;
+    std::ofstream rec;
+    if (!rx.recordPath.empty()) {
+        rec.open(rx.recordPath, std::ios::binary);
+        std::cout << "Recording raw CF32 IQ to " << rx.recordPath << "\n" << std::flush;
+    }
+    const int duration = rx.durationSec > 0 ? rx.durationSec : 20;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(duration);
+
+    while (!g_stop.load() && std::chrono::steady_clock::now() < deadline) {
+        void* bufs[1] = { buff.data() };
+        int flags = 0; long long ts = 0;
+        int n = dev->readStream(stream, bufs, buff.size(), flags, ts, 200000);
+        if (n > 0) {
+            inter.resize(size_t(n) * 2);
+            for (int i = 0; i < n; ++i) {
+                inter[2 * i]     = buff[i].real();
+                inter[2 * i + 1] = buff[i].imag();
+            }
+            if (rec) rec.write(reinterpret_cast<const char*>(inter.data()),
+                               std::streamsize(inter.size() * sizeof(float)));
+            recv.process(inter.data(), size_t(n));
+        }
+    }
+
+    if (rec) rec.close();
+
+    dev->deactivateStream(stream);
+    dev->closeStream(stream);
+    SoapySDR::Device::unmake(dev);
+
+    auto& s = recv.stats();
+    std::cout << "samples=" << s.samples << " symbols=" << s.symbols
+              << " fswHits=" << s.fswHits << " nidOk=" << s.nidOk
+              << " framesTried=" << s.framesTried << " crcOk=" << s.crcOk
+              << " tsbks=" << s.tsbks
+              << " minFswDist=" << s.minFswDist << "/" << s.minFswDistInv << "\n";
+    return 0;
 }
 
 } // namespace
@@ -185,6 +401,12 @@ int main(int argc, char** argv)
         printUsage(argv[0]);
         return 1;
     }
+
+    if (!rxSource.iqPath.empty())
+        return runOfflineIq(rxSource);
+
+    if (rxSource.native)
+        return runNativeLive(rxSource, cfg);
 
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
