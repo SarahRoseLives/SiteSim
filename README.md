@@ -7,6 +7,17 @@
 
 The goal of the project is to let you stand up a small, understandable P25 site model, watch what it is doing, and test subscriber behavior against it.
 
+> **RF / legal warning — read before transmitting**
+>
+> SiteSim keys a transmitter and can advertise and grant voice channels. Transmitting on a frequency you are not authorized to use is illegal in most countries and can interfere with public-safety, commercial, and other licensed systems.
+>
+> - Only transmit on **amateur radio bands**, and only if you hold a valid amateur license that covers the band and mode, and stay within your license's power and operating privileges.
+> - Follow your national regulator's rules (for example FCC Part 97 in the US), the band plan, and any local coordination.
+> - For bench and lab testing, transmit into a **dummy load or shielded enclosure**, or apply enough attenuation that essentially no RF is radiated. Do not connect a power amplifier.
+> - Never operate SiteSim on public-safety, business, or any other spectrum you are not licensed for.
+>
+> The authors accept no liability for misuse or for any legal or regulatory consequences of operating this software.
+
 ![SiteSim screenshot](screenshot.png)
 
 ## How the project is split up
