@@ -21,7 +21,7 @@ It has a GUI for configuring a site, starts the control channel transmitter, run
 
 This is the uplink receiver path pulled out into a standalone tool.
 
-It exists so the `dsd-neo`-based receive chain can be tested by itself, without involving the rest of the GUI application or control-channel transmitter.
+It exists so the native in-process receive chain can be tested by itself, without involving the rest of the GUI application or control-channel transmitter. It can decode from a recorded IQ file (WAV / CF32), from a live RTL-SDR (librtlsdr), from a live SoapySDR device, or from a built-in loopback self-test that modulates known TSBKs and decodes them again.
 
 ### `subscriber_test`
 
@@ -47,9 +47,19 @@ When uplink activity causes the site to need to answer something, SiteSim queues
 
 ## 2. Uplink reception
 
-The receive side uses an RTL-SDR and `dsd-neo` in P25 ISP mode.
+The receive side is a native, in-process P25 Phase 1 receiver (`p25rx::P25Receiver`). It does not shell out to an external decoder.
 
-In this mode, the site listens for mobile-originated TSBKs on the uplink frequency and interprets them as subscriber-to-site requests rather than site-to-subscriber traffic.
+The chain is the inverse of the transmitter:
+
+- capture IQ — RTL-SDR via librtlsdr directly, or the shared SoapySDR device for a Pluto
+- downconvert the deliberately off-centre capture to baseband (the RX is tuned
+  away from the signal so it does not sit on the tuner DC spike) and decimate to
+  ~48 kHz
+- FM discriminator, then symbol timing locked per burst by **correlating the
+  48-bit frame-sync word** (robust on short uplink bursts where a free-running
+  timing loop would not settle)
+- integrate over each symbol (matched filter), slice the 4-level C4FM
+- NID (BCH) → de-interleave → 4-state Viterbi → CRC-16 to recover the TSBK
 
 Examples of uplink traffic the receiver understands:
 
@@ -59,7 +69,7 @@ Examples of uplink traffic the receiver understands:
 - unit-to-unit voice channel requests
 - emergency alarm requests
 
-The RX path logs raw sync/status information from `dsd-neo`, then forwards decoded ISP events into SiteSim’s own RX log.
+Decoded TSBKs are logged and forwarded into SiteSim’s ISP handling, which drives the automatic site responses below.
 
 ## 3. Automatic site responses
 
@@ -99,17 +109,21 @@ field for your repeater's actual input; the offset sent in `IDEN_UP` follows.
 
 ## 5. Radio backends
 
-SiteSim uses SoapySDR for the transmitter and dsd-neo for the uplink receiver.
+SiteSim uses SoapySDR for the transmitter and its own native receiver for the uplink.
 
 - **HackRF + RTL-SDR (default):** the control channel transmits on the SoapySDR
-  device (HackRF), while the uplink receiver runs on a separate RTL-SDR via
-  dsd-neo's native librtlsdr path.
+  device (HackRF), while the uplink receiver runs on a separate RTL-SDR captured
+  directly through librtlsdr (RTLSDR AGC, tuned offset from the signal to dodge
+  the tuner DC spike).
 - **ADALM-Pluto (single radio, full duplex):** the Pluto performs both jobs at
-  once. SiteSim opens one SoapySDR device, keeps the TX stream, and hands the
-  same device handle to dsd-neo for RX. TX and RX are tuned independently
-  (control channel vs. site input) and both run at 1.536 MS/s so the AD9361
-  baseband rate is shared. The Pluto is preferred automatically when present;
-  the **Device** menu lets you choose another SoapySDR device.
+  once. SiteSim opens one SoapySDR device, keeps the TX stream, and opens an RX
+  stream on the same handle for the native receiver. TX and RX are tuned
+  independently (control channel vs. site input) and both run at 1.536 MS/s so
+  the AD9361 baseband rate is shared. The Pluto is preferred automatically when
+  present; the **Device** menu lets you choose another SoapySDR device.
+
+The native receiver has no external runtime dependency; `dsd-neo` remains
+vendored in the tree but is not required for the receive path.
 
 SoapyPlutoSDR is not part of MSYS2; see `COMPILE.md` for installation details.
 Note that the stock Pluto's AD9363 tunes about **325 MHz–3.8 GHz**, so the 2m
@@ -122,11 +136,11 @@ verifies the tuned frequency and will not key TX if the hardware rejects it.
 
 Its job is simple:
 
-- tune the RTL-SDR
-- run the `dsd-neo` uplink decode path
+- tune the receiver (or read a recorded IQ file)
+- run the native uplink decode path
 - print sync and decoded ISP traffic
 
-That makes it useful for isolating problems. If `subscriber_test` works against `uplink_test`, then the subscriber-side modulation and the raw uplink decoder are both basically correct before bringing the full GUI application back into the loop.
+That makes it useful for isolating problems. If `subscriber_test` works against `uplink_test`, then the subscriber-side modulation and the raw uplink decoder are both basically correct before bringing the full GUI application back into the loop. `uplink_test --selftest` modulates a set of known TSBKs and decodes them again with no RF involved, which validates the whole DSP + FEC chain in isolation.
 
 ## How `subscriber_test` works
 
