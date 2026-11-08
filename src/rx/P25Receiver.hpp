@@ -39,6 +39,9 @@ public:
         int      minFswDist    = 99;      // best FSW Hamming distance seen
         int      minFswDistInv = 99;      // best FSW distance with inverted dibits
         uint64_t dibitCount[4] = {0,0,0,0};
+        // Coarse symbol-value histogram, bins over [-6,+6] (24 bins).
+        uint64_t symHist[24] = {0};
+        float    symMin = 1e9f, symMax = -1e9f;
     };
 
     P25Receiver();
@@ -50,6 +53,7 @@ public:
     void setTsbkCallback(TsbkCallback cb) { m_onTsbk = std::move(cb); }
     void setLogCallback(LogCallback cb)   { m_onLog  = std::move(cb); }
     void setInvert(bool inv) { m_invert = inv; }   // flip C4FM polarity
+    void setSsInterval(int n) { if (n > 0) m_ssInterval = n; }
 
     // Process complex baseband samples (interleaved I,Q; length = n*2).
     void process(const float* iq, size_t n);
@@ -76,6 +80,7 @@ private:
     double  m_nextPos = 0.0;      // absolute position of next symbol sample
     float   m_agc     = 0.0f;     // adaptive level normalizer
     float   interpAt(double pos) const;
+    float   integrateDump(double pos) const;
 
     // Dibit / frame state machine
     uint8_t  m_dibit    = 0;
@@ -94,6 +99,7 @@ private:
     bool     m_invert  = false;
     float    m_fmScale = 1.0f;    // fm -> normalized units (outer symbol ~ +/-3)
     float    m_dc      = 0.0f;    // slow DC/carrier-offset tracker
+    int      m_ssInterval = 35;   // frame dibits between OSP status symbols
 
     Stats         m_stats;
     TsbkCallback  m_onTsbk;

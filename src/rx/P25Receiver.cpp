@@ -91,6 +91,24 @@ float P25Receiver::interpAt(double pos) const
     return a + float(frac) * (b - a);
 }
 
+float P25Receiver::integrateDump(double pos) const
+{
+    // Average the discriminator output over one symbol period centred on pos.
+    // Averages out high-frequency noise; P25 C4FM slices well on this.
+    if (m_fmHist.size() < 2) return 0.0f;
+    double lo = pos - m_spsEst * 0.5;
+    double hi = pos + m_spsEst * 0.5;
+    long i0 = long(std::floor(lo));
+    long i1 = long(std::floor(hi));
+    long last = long(m_fmBase + m_fmHist.size()) - 1;
+    if (i0 < long(m_fmBase)) i0 = long(m_fmBase);
+    if (i1 > last) i1 = last;
+    if (i1 <= i0) return interpAt(pos);
+    double sum = 0.0;
+    for (long i = i0; i <= i1; ++i) sum += m_fmHist[size_t(i - long(m_fmBase))];
+    return float(sum / double(i1 - i0 + 1));
+}
+
 void P25Receiver::process(const float* iq, size_t n)
 {
     if (!iq || n == 0 || m_sps <= 0.0) return;
@@ -127,14 +145,14 @@ void P25Receiver::process(const float* iq, size_t n)
         if (pos + 1.0 >= double(m_fmBase + m_fmHist.size())) break;      // need future sample
         if (midPos >= 0.0 && midPos + 1.0 < double(m_fmBase)) break;
 
-        float cur = interpAt(pos);
+        float cur = integrateDump(pos);
         float mid = interpAt(midPos);
 
         if (m_haveSym) {
             float e = mid * (cur - m_symPrev);      // Gardner error
-            m_spsEst += 0.0008 * e;
-            if (m_spsEst < m_sps * 0.98) m_spsEst = m_sps * 0.98;
-            if (m_spsEst > m_sps * 1.02) m_spsEst = m_sps * 1.02;
+            m_spsEst += 0.00015 * e;
+            if (m_spsEst < m_sps * 0.995) m_spsEst = m_sps * 0.995;
+            if (m_spsEst > m_sps * 1.005) m_spsEst = m_sps * 1.005;
         }
         m_symPrev = cur;
         m_haveSym = true;
@@ -158,6 +176,15 @@ void P25Receiver::sliceSymbol(float sym)
 {
     // sym is already normalized (outer ~ +/-3, inner ~ +/-1) via m_fmScale.
     float v = sym;
+
+    if (sym < m_stats.symMin) m_stats.symMin = sym;
+    if (sym > m_stats.symMax) m_stats.symMax = sym;
+    {
+        int b = int((sym + 6.0f) / 12.0f * 24.0f);
+        if (b < 0) b = 0;
+        if (b > 23) b = 23;
+        m_stats.symHist[b]++;
+    }
 
     uint8_t d;
     if (v > 2.0f)        d = 0x1;  // +3 -> 01
@@ -199,7 +226,7 @@ void P25Receiver::pushDibit(uint8_t d)
         ++m_frameIdx;                                // frame dibit 25..154
         if (m_frameIdx <= 154) {
             m_frameBuf[m_frameIdx - 25] = d;         // buffer 0..129
-            if (m_frameIdx % 35 == 0) m_skipSS = true;
+            if (m_frameIdx % m_ssInterval == 0) m_skipSS = true;
             if (m_frameIdx == 154) processFrame();
         }
         break;

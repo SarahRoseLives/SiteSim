@@ -1,5 +1,8 @@
 #include "rx/RxPipeline.hpp"
 #include "rx/P25Receiver.hpp"
+#include "p25/C4FM.hpp"
+#include "p25/Frame.hpp"
+#include "p25/TSBK.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -85,10 +88,12 @@ struct RxSource {
 
     // Native (in-process) P25Receiver live decode via SoapySDR RX.
     bool        native   = false;
-    double      rxGainDb = 20.0;
+    double      rxGainDb = -1.0;
     bool        invert   = false;
     std::string recordPath;      // write raw CF32 IQ instead of/while decoding
     bool        iqCf32   = false;  // offline reader: file is raw float32 I/Q
+    bool        selftest = false;  // modulate known TSBKs -> decode (no RF)
+    int         ssInterval = 35;   // OSP status symbol interval (frame dibits)
 };
 
 ParseResult parseArgs(int argc, char** argv, SiteConfig& cfg, RxSource& rx)
@@ -221,6 +226,16 @@ ParseResult parseArgs(int argc, char** argv, SiteConfig& cfg, RxSource& rx)
             rx.iqCf32 = true;
             continue;
         }
+        if (arg == "--selftest") {
+            rx.selftest = true;
+            continue;
+        }
+        if (arg == "--ss") {
+            const char* value = requireValue("--ss");
+            if (!value) return ParseResult::Error;
+            rx.ssInterval = std::stoi(value);
+            continue;
+        }
 
         std::cerr << "Unknown option: " << arg << "\n";
         printUsage(argv[0]);
@@ -256,6 +271,7 @@ int runOfflineIq(const RxSource& rx)
 
     p25rx::P25Receiver recv;
     recv.configure(double(rx.iqRate), 0);
+    recv.setSsInterval(rx.ssInterval);
     uint64_t count = 0;
     recv.setTsbkCallback([&](const std::array<uint8_t, 12>& t) {
         char line[200];
@@ -293,6 +309,10 @@ int runOfflineIq(const RxSource& rx)
     std::cout << "minFswDist=" << s.minFswDist << " minFswDistInv=" << s.minFswDistInv
               << " dibits[" << s.dibitCount[0] << "," << s.dibitCount[1]
               << "," << s.dibitCount[2] << "," << s.dibitCount[3] << "]\n";
+    std::cout << "symRange=[" << s.symMin << "," << s.symMax << "]\n";
+    std::cout << "symHist(-6..+6):";
+    for (int b = 0; b < 24; ++b) std::cout << " " << (b - 12) << ":" << s.symHist[b];
+    std::cout << "\n";
     return count ? 0 : 2;
 }
 
@@ -311,7 +331,10 @@ int runNativeLive(const RxSource& rx, const SiteConfig& cfg)
     try {
         dev->setSampleRate(SOAPY_SDR_RX, 0, double(rate));
         dev->setFrequency(SOAPY_SDR_RX, 0, freq);
-        try { dev->setGain(SOAPY_SDR_RX, 0, rx.rxGainDb); } catch (...) {}
+        try {
+            if (rx.rxGainDb < 0.0) dev->setGainMode(SOAPY_SDR_RX, 0, true);   // AGC
+            else                  dev->setGain(SOAPY_SDR_RX, 0, rx.rxGainDb);
+        } catch (...) {}
         try { dev->setBandwidth(SOAPY_SDR_RX, 0, double(rate)); } catch (...) {}
         stream = dev->setupStream(SOAPY_SDR_RX, "CF32");
         if (!stream) throw std::runtime_error("setupStream failed");
@@ -324,6 +347,7 @@ int runNativeLive(const RxSource& rx, const SiteConfig& cfg)
 
     p25rx::P25Receiver recv;
     recv.configure(double(rate), cfg.nac);
+    recv.setSsInterval(rx.ssInterval);
     recv.setInvert(rx.invert);
     uint64_t count = 0;
     recv.setTsbkCallback([&](const std::array<uint8_t, 12>& t) {
@@ -342,6 +366,7 @@ int runNativeLive(const RxSource& rx, const SiteConfig& cfg)
 
     std::vector<std::complex<float>> buff(16384);
     std::vector<float> inter;
+    double rmsAcc = 0.0; uint64_t rmsN = 0;
     std::ofstream rec;
     if (!rx.recordPath.empty()) {
         rec.open(rx.recordPath, std::ios::binary);
@@ -359,6 +384,8 @@ int runNativeLive(const RxSource& rx, const SiteConfig& cfg)
             for (int i = 0; i < n; ++i) {
                 inter[2 * i]     = buff[i].real();
                 inter[2 * i + 1] = buff[i].imag();
+                rmsAcc += double(buff[i].real()) * buff[i].real() + double(buff[i].imag()) * buff[i].imag();
+                ++rmsN;
             }
             if (rec) rec.write(reinterpret_cast<const char*>(inter.data()),
                                std::streamsize(inter.size() * sizeof(float)));
@@ -372,6 +399,7 @@ int runNativeLive(const RxSource& rx, const SiteConfig& cfg)
     dev->closeStream(stream);
     SoapySDR::Device::unmake(dev);
 
+    if (rmsN) std::cout << "IQ rms=" << std::sqrt(rmsAcc / double(rmsN)) << "\n";
     auto& s = recv.stats();
     std::cout << "samples=" << s.samples << " symbols=" << s.symbols
               << " fswHits=" << s.fswHits << " nidOk=" << s.nidOk
@@ -379,6 +407,59 @@ int runNativeLive(const RxSource& rx, const SiteConfig& cfg)
               << " tsbks=" << s.tsbks
               << " minFswDist=" << s.minFswDist << "/" << s.minFswDistInv << "\n";
     return 0;
+}
+
+int runSelfTest()
+{
+    const double rate = 1536000.0;
+    p25::C4FM mod;
+    if (!mod.configure(rate)) { std::cerr << "mod configure failed\n"; return 1; }
+    mod.setDeviationPeakHz(1800.0);
+
+    std::vector<std::array<uint8_t, 12>> sent;
+    std::vector<uint8_t> dibits;
+    auto add = [&](const std::array<uint8_t, 12>& t) {
+        sent.push_back(t);
+        auto d = p25::BuildFrame(0x123, t);
+        dibits.insert(dibits.end(), d.begin(), d.end());
+    };
+    add(p25::BuildURegRsp(true, 0x123, 1, 1));
+    add(p25::BuildGrpAffRsp(false, 0, 1, 1, 1));
+    add(p25::BuildGrpVChGrant(0, 1, 1, 1, 1));
+    add(p25::BuildNetStatusBcast(0xBEEF0, 0x123, 1, 0, 0x70));
+    add(p25::BuildIDENUp(1, 100, 0, 100, 438800000ull));
+    for (int k = 0; k < 5; ++k) add(sent[0]);   // repeat U_REG for margin
+
+    auto iq8 = mod.modulate(dibits);
+    std::cout << "selftest: " << sent.size() << " frames, " << iq8.size() / 2
+              << " samples generated\n";
+
+    p25rx::P25Receiver recv;
+    recv.configure(rate, 0);
+    uint64_t ok = 0;
+    recv.setTsbkCallback([&](const std::array<uint8_t, 12>& t) {
+        std::printf("  decoded TSBK op=0x%02X raw=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                    t[0] & 0x3F, t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7],
+                    t[8], t[9], t[10], t[11]);
+        ++ok;
+    });
+
+    std::vector<float> buf;
+    buf.reserve(8192);
+    for (size_t k = 0; k + 1 < iq8.size(); k += 2) {
+        buf.push_back(iq8[k] / 100.0f);
+        buf.push_back(iq8[k + 1] / 100.0f);
+        if (buf.size() >= 8192) { recv.process(buf.data(), buf.size() / 2); buf.clear(); }
+    }
+    if (!buf.empty()) recv.process(buf.data(), buf.size() / 2);
+
+    auto& s = recv.stats();
+    std::cout << "selftest stats: symbols=" << s.symbols << " fswHits=" << s.fswHits
+              << " nidOk=" << s.nidOk << " framesTried=" << s.framesTried
+              << " crcOk=" << s.crcOk << " tsbks=" << s.tsbks
+              << " minFswDist=" << s.minFswDist << "\n";
+    std::cout << "selftest: decoded " << ok << " / " << sent.size() << " frames\n";
+    return ok ? 0 : 2;
 }
 
 } // namespace
@@ -401,6 +482,9 @@ int main(int argc, char** argv)
         printUsage(argv[0]);
         return 1;
     }
+
+    if (rxSource.selftest)
+        return runSelfTest();
 
     if (!rxSource.iqPath.empty())
         return runOfflineIq(rxSource);
@@ -514,3 +598,4 @@ int main(int argc, char** argv)
     txDummy.stopTx();
     return 0;
 }
+
