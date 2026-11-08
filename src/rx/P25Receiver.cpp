@@ -117,23 +117,34 @@ void P25Receiver::process(const float* iq, size_t n)
     if (!iq || n == 0 || m_sps <= 0.0) return;
 
     // Decimate IQ to the demod rate, then FM-discriminate.
+    const double mixInc = 2.0 * M_PI * m_mixOffsetHz / m_sampleRate;
     m_fmHist.reserve(m_fmHist.size() + n / size_t(std::max(1, m_decim)) + 8);
     for (size_t k = 0; k < n; ++k) {
-        m_decimI += iq[2 * k];
-        m_decimQ += iq[2 * k + 1];
+        float I = iq[2 * k];
+        float Q = iq[2 * k + 1];
+        if (m_mixOffsetHz != 0.0) {
+            double c = std::cos(m_mixPhase), s = std::sin(m_mixPhase);
+            float mI = float(double(I) * c - double(Q) * s);
+            float mQ = float(double(I) * s + double(Q) * c);
+            I = mI; Q = mQ;
+            m_mixPhase += mixInc;
+            if (m_mixPhase > 2.0 * M_PI) m_mixPhase -= 2.0 * M_PI;
+        }
+        m_decimI += I;
+        m_decimQ += Q;
         m_stats.samples++;
         if (++m_decimN < m_decim) continue;
-        float I = float(m_decimI / double(m_decim));
-        float Q = float(m_decimQ / double(m_decim));
+        float dI = float(m_decimI / double(m_decim));
+        float dQ = float(m_decimQ / double(m_decim));
         m_decimI = 0.0; m_decimQ = 0.0; m_decimN = 0;
 
         float fm = 0.0f;
         if (m_havePrev) {
-            float re = I * m_prevI + Q * m_prevQ;   // dot
-            float im = Q * m_prevI - I * m_prevQ;   // cross
+            float re = dI * m_prevI + dQ * m_prevQ;   // dot
+            float im = dQ * m_prevI - dI * m_prevQ;   // cross
             fm = std::atan2(im, re);
         }
-        m_prevI = I; m_prevQ = Q; m_havePrev = true;
+        m_prevI = dI; m_prevQ = dQ; m_havePrev = true;
         m_dc += (fm - m_dc) * 0.0007f;   // ~30 ms time constant at 48 kHz
         m_fmHist.push_back((fm - m_dc) * m_fmScale);
     }

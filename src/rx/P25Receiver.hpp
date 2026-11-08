@@ -54,6 +54,9 @@ public:
     void setLogCallback(LogCallback cb)   { m_onLog  = std::move(cb); }
     void setInvert(bool inv) { m_invert = inv; }   // flip C4FM polarity
     void setSsInterval(int n) { if (n > 0) m_ssInterval = n; }
+    // Downconvert an off-centre capture to baseband before decimation (brings
+    // the signal to DC and pushes the tuner DC spike out of the passband).
+    void setMixOffset(double hz) { m_mixOffsetHz = hz; m_mixPhase = 0.0; }
 
     // Process complex baseband samples (interleaved I,Q; length = n*2).
     void process(const float* iq, size_t n);
@@ -73,6 +76,8 @@ private:
     int    m_decimN  = 0;
     double m_decimI  = 0.0, m_decimQ = 0.0;
     double m_demodRate = 48000.0;
+    double m_mixOffsetHz = 0.0;
+    double m_mixPhase    = 0.0;
 
     // Timing recovery (Gardner) state
     double m_sps        = 10.0;   // samples per symbol (fs / 4800)
