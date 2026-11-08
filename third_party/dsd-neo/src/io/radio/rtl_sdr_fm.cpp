@@ -5561,6 +5561,7 @@ stream_open_open_device_soapy(const dsd_opts* opts) {
     soapy_cfg.gains = opts->soapy_gains;
     soapy_cfg.stream_format = opts->soapy_stream_format;
     soapy_cfg.bandwidth_hz = opts->soapy_bandwidth_hz;
+    soapy_cfg.sample_rate_hz = opts->soapy_sample_rate_hz;
     int soapy_cfg_rc = rtl_device_configure_soapy_sized(rtl_device_handle, &soapy_cfg, RTL_SOAPY_CONFIG_SIZE);
     if (soapy_cfg_rc != 0) {
         LOG_ERROR("Failed to apply SoapySDR profile/configuration (rc=%d).\n", soapy_cfg_rc);

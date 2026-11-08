@@ -93,6 +93,21 @@ class Stream;
 } // namespace SoapySDR
 #endif
 
+#ifdef USE_SOAPYSDR
+/* Set by the embedding application so RX can share an already-open device
+   (e.g. one ADALM-Pluto serving separate TX and RX streams). Borrowed handle. */
+static SoapySDR::Device* g_external_soapy_device = nullptr;
+#endif
+
+void
+rtl_device_set_external_soapy_device(void* device) {
+#ifdef USE_SOAPYSDR
+    g_external_soapy_device = static_cast<SoapySDR::Device*>(device);
+#else
+    (void)device;
+#endif
+}
+
 #ifdef USE_RTLSDR
 #include <rtl-sdr.h>
 #else
@@ -363,6 +378,8 @@ struct rtl_device {
     uint64_t soapy_last_overflow_log_ns = 0U;
     int soapy_profile_id = 0;
     int soapy_requested_bandwidth_hz = 0;
+    int soapy_requested_sample_rate_hz = 0;
+    int soapy_external = 0;
     int soapy_named_gain_override = 0;
     int soapy_named_gain_skip_logged = 0;
     char soapy_args_string[1024] = {};
@@ -2844,7 +2861,7 @@ soapy_stream_cleanup(struct rtl_device* dev, int unmake_device) {
         }
         dev->soapy_stream = NULL;
     }
-    if (unmake_device && dev->soapy_dev) {
+    if (unmake_device && dev->soapy_dev && !dev->soapy_external) {
         try {
             SoapySDR::Device::unmake(dev->soapy_dev);
         } catch (const std::exception& e) {
@@ -3094,7 +3111,7 @@ static DSD_THREAD_RETURN_TYPE
 
     size_t mtu_elems = 16384;
     if (soapy_setup_stream(s, &mtu_elems) != 0) {
-        soapy_stream_cleanup(s, 1);
+        soapy_stream_cleanup(s, s->soapy_external ? 0 : 1);
         s->run.store(0);
         DSD_THREAD_RETURN;
     }
@@ -3102,7 +3119,7 @@ static DSD_THREAD_RETURN_TYPE
     std::vector<std::complex<float>> cf32_buf;
     std::vector<int16_t> cs16_buf;
     if (soapy_allocate_thread_buffers(s, mtu_elems, &cf32_buf, &cs16_buf) != 0) {
-        soapy_stream_cleanup(s, 1);
+        soapy_stream_cleanup(s, s->soapy_external ? 0 : 1);
         s->run.store(0);
         DSD_THREAD_RETURN;
     }
@@ -3148,7 +3165,7 @@ static DSD_THREAD_RETURN_TYPE
         soapy_submit_samples(s, drop_elems, kept_elems, cf32_buf, cs16_buf, apply_rot);
     }
 
-    soapy_stream_cleanup(s, fatal ? 1 : 0);
+    soapy_stream_cleanup(s, (fatal && !s->soapy_external) ? 1 : 0);
     s->run.store(0);
     DSD_THREAD_RETURN;
 #endif
@@ -4911,6 +4928,8 @@ rtl_device_alloc_soapy_base(struct input_ring_state* input_ring, int use_combine
     dev->combine_rotate_enabled = use_combine_rotate;
     dev->backend = RTL_BACKEND_SOAPY;
     dev->soapy_format = SOAPY_FMT_NONE;
+    dev->soapy_external = 0;
+    dev->soapy_requested_sample_rate_hz = 0;
     rtl_capture_u8_byte_carry_clear(&dev->iq_byte_carry);
     dev->sockfd = DSD_INVALID_SOCKET;
     dev->host[0] = '\0';
@@ -4984,11 +5003,18 @@ rtl_device_create_soapy(const char* soapy_args, struct input_ring_state* input_r
         return NULL;
     }
     try {
-        SoapySDR::KwargsList found = SoapySDR::Device::enumerate(args_string);
-        if (found.empty()) {
-            DSD_FPRINTF(stderr, "SoapySDR: enumerate found no devices for args '%s'.\n", args_cstr);
+        if (g_external_soapy_device) {
+            /* Borrow the caller's device so TX and RX share one handle. */
+            dev->soapy_dev = g_external_soapy_device;
+            dev->soapy_external = 1;
+            DSD_FPRINTF(stderr, "SoapySDR: using externally-owned device for RX.\n");
+        } else {
+            SoapySDR::KwargsList found = SoapySDR::Device::enumerate(args_string);
+            if (found.empty()) {
+                DSD_FPRINTF(stderr, "SoapySDR: enumerate found no devices for args '%s'.\n", args_cstr);
+            }
+            dev->soapy_dev = SoapySDR::Device::make(args_string);
         }
-        dev->soapy_dev = SoapySDR::Device::make(args_string);
     } catch (const std::exception& e) {
         DSD_FPRINTF(stderr, "SoapySDR: exception in Device::make: %s\n", e.what());
         dev->soapy_dev = NULL;
@@ -5042,6 +5068,8 @@ rtl_device_store_soapy_config_request(struct rtl_device* dev, const struct rtl_s
     rtl_device_copy_cstr(dev->soapy_requested_stream_format, sizeof(dev->soapy_requested_stream_format), stream_format);
     dev->soapy_requested_bandwidth_hz =
         RTL_SOAPY_CONFIG_FIELD_AVAILABLE(cfg, config_size, bandwidth_hz) ? cfg->bandwidth_hz : -1;
+    dev->soapy_requested_sample_rate_hz =
+        RTL_SOAPY_CONFIG_FIELD_AVAILABLE(cfg, config_size, sample_rate_hz) ? cfg->sample_rate_hz : 0;
 }
 
 #ifdef USE_SOAPYSDR
@@ -5261,7 +5289,7 @@ rtl_device_close_backend_resources(struct rtl_device* dev) {
         dsd_socket_close(dev->sockfd);
     }
     if (dev->backend == RTL_BACKEND_SOAPY) {
-        soapy_stream_cleanup(dev, 1);
+        soapy_stream_cleanup(dev, dev->soapy_external ? 0 : 1);
         if (dev->soapy_lock_inited) {
             (void)dsd_mutex_destroy(&dev->soapy_lock);
             dev->soapy_lock_inited = 0;
@@ -5389,21 +5417,41 @@ rtl_device_set_sample_rate(struct rtl_device* dev, uint32_t samp_rate) {
 #ifdef USE_SOAPYSDR
         if (dev->backend == RTL_BACKEND_SOAPY) {
             rc = soapy_call_locked(dev, "setSampleRate", [&]() -> int {
-                double requested = (double)samp_rate;
+                /* An explicit override is used verbatim so a full-duplex TX/RX
+                   pair on one device can share a compatible rate. */
+                const bool have_override = dev->soapy_requested_sample_rate_hz > 0;
+                double requested = have_override ? (double)dev->soapy_requested_sample_rate_hz : (double)samp_rate;
                 double applied = requested;
                 bool adjusted = false;
-                try {
-                    std::vector<double> listed =
-                        soapy_valid_positive_rates(dev->soapy_dev->listSampleRates(SOAPY_SDR_RX, 0));
-                    std::vector<dsdneo::SoapyRange> ranges =
-                        soapy_ranges_from_range_list(dev->soapy_dev->getSampleRateRange(SOAPY_SDR_RX, 0));
-                    applied = dsdneo::soapy_nearest_sample_rate(requested, listed, ranges, &adjusted);
-                } catch (const std::exception&) {
-                    applied = requested;
+                if (!have_override) {
+                    try {
+                        std::vector<double> listed =
+                            soapy_valid_positive_rates(dev->soapy_dev->listSampleRates(SOAPY_SDR_RX, 0));
+                        std::vector<dsdneo::SoapyRange> ranges =
+                            soapy_ranges_from_range_list(dev->soapy_dev->getSampleRateRange(SOAPY_SDR_RX, 0));
+                        applied = dsdneo::soapy_nearest_sample_rate(requested, listed, ranges, &adjusted);
+                    } catch (const std::exception&) {
+                        applied = requested;
+                    }
                 }
                 if (adjusted) {
                     DSD_FPRINTF(stderr, "SoapySDR: adjusted sample rate from %.0f Hz to %.0f Hz.\n", requested,
                                 applied);
+                } else if (have_override) {
+                    /* Skip a redundant retune when a shared full-duplex device
+                       is already running both directions at this rate. */
+                    double current = 0.0;
+                    try {
+                        current = dev->soapy_dev->getSampleRate(SOAPY_SDR_RX, 0);
+                    } catch (const std::exception&) {
+                        current = 0.0;
+                    }
+                    if (current > 0.0 && std::lround(current) == std::lround(applied)) {
+                        applied_rate = (uint32_t)std::lround(current);
+                        DSD_FPRINTF(stderr, "SoapySDR: RX already at %.0f Hz.\n", current);
+                        return 0;
+                    }
+                    DSD_FPRINTF(stderr, "SoapySDR: using exact RX sample rate %.0f Hz.\n", applied);
                 }
                 dev->soapy_dev->setSampleRate(SOAPY_SDR_RX, 0, applied);
                 applied_rate = (uint32_t)std::lround(applied);

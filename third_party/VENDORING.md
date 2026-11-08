@@ -25,6 +25,16 @@ top-level `CMakeLists.txt` (`ExternalProject`/superbuild wiring).
      `opts->p25_isp_mode` is set.
   6. `src/runtime/cli/args.c` — include `<getopt.h>` on mingw (upstream only
      provides getopt for MSVC; not used by SiteSim but part of the runtime lib).
+  7. `include/dsd-neo/io/rtl_device.h` + `src/io/radio/rtl_device.cpp` — new
+     `rtl_device_set_external_soapy_device()` lets SiteSim hand dsd-neo an
+     already-open `SoapySDR::Device*` for RX (borrowed; not unmade). Required for
+     full-duplex ADALM-Pluto, where one device handle carries both TX and RX.
+  8. `include/dsd-neo/core/opts.h` + `src/core/util/dsd_init.c` +
+     `include/dsd-neo/io/rtl_device.h` + `src/io/radio/rtl_device.cpp` +
+     `src/io/radio/rtl_sdr_fm.cpp` — new `soapy_sample_rate_hz` option asks for
+     an exact SoapySDR RX rate instead of snapping to the driver's advertised
+     rates. SiteSim sets this to 1.536 MS/s for Pluto so RX (24 kHz DSP) and TX
+     use the same AD9361 baseband rate.
 
-To refresh from upstream: re-clone the pinned commit, re-apply items 1-6, and
+To refresh from upstream: re-clone the pinned commit, re-apply items 1-8, and
 copy the tree here (excluding `.git` and any `build*` directories).

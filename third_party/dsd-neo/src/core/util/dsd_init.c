@@ -189,6 +189,7 @@ init_opts_decoder_and_input_defaults(dsd_opts* opts) {
     opts->rtlsdr_center_freq =
         850000000; //set to an initial value (if user is using a channel map, then they won't need to specify anything other than -i rtl if desired)
     opts->soapy_bandwidth_hz = -1;
+    opts->soapy_sample_rate_hz = 0;
     opts->soapy_profile[0] = '\0';
     opts->soapy_stream_format[0] = '\0';
     opts->soapy_antenna[0] = '\0';

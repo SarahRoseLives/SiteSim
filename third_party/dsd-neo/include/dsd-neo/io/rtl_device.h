@@ -44,6 +44,8 @@ struct rtl_soapy_config {
     const char* stream_format;
     int bandwidth_hz;
     const char* settings;
+    /* Exact RX sample rate in Hz. 0 leaves the default nearest-rate selection. */
+    int sample_rate_hz;
 };
 
 #define RTL_SOAPY_CONFIG_LEGACY_SIZE offsetof(struct rtl_soapy_config, settings)
@@ -86,6 +88,16 @@ struct rtl_device* rtl_device_create_tcp(const char* host, int port, struct inpu
  */
 struct rtl_device* rtl_device_create_soapy(const char* soapy_args, struct input_ring_state* input_ring,
                                            int use_combine_rotate);
+
+/**
+ * @brief Use an externally-owned SoapySDR device for RX instead of opening one.
+ *
+ * The pointer is a borrowed `SoapySDR::Device*`; dsd-neo will not unmake it and
+ * the owner must keep it alive for the duration of the RX stream. This lets a
+ * full-duplex radio (e.g. ADALM-Pluto) serve both TX and RX from one device
+ * handle. Must be set before the RX stream opens; pass NULL to clear.
+ */
+void rtl_device_set_external_soapy_device(void* device);
 
 /**
  * @brief Apply SoapySDR-specific profile and capability-aware startup options.

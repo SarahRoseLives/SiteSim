@@ -10,7 +10,9 @@
 #   MINGW_BIN    mingw64 bin directory (source of the DLLs, by basename)
 #   LDD          path to the ldd executable
 # Optional:
-#   SOAPY_MODULE_DIR  mingw64 SoapySDR modules dir (e.g. .../lib/SoapySDR/modules0.8)
+#   SOAPY_MODULE_DIRS ;-separated SoapySDR module dirs (e.g. mingw64's
+#                     .../lib/SoapySDR/modules0.8 and a PothosSDR install)
+#   SOAPY_MODULE_DIR  single-module-dir spelling (backwards compatible)
 #   EXTRA_DLL_DIRS    extra ;-separated dirs to search for DLLs by basename
 #                     (e.g. the superbuild vendor prefix that holds libmbe-neo.dll)
 
@@ -99,17 +101,30 @@ copy_mingw_closure("${DEST_DIR}" "${EXE}")
 # 2. SoapySDR device modules + their dependency closure.
 #    Modules go in <dest>/SoapySDR/modules0.8 (SoapyTx points
 #    SOAPY_SDR_PLUGIN_PATH here at runtime); their extra DLL deps (libhackrf,
-#    librtlsdr, libusb, ...) go next to the .exe so the loader finds them.
-if(SOAPY_MODULE_DIR AND EXISTS "${SOAPY_MODULE_DIR}")
+#    librtlsdr, libiio, libad9361, libusb, ...) go next to the .exe so the
+#    loader finds them.
+set(_module_dirs "")
+if(SOAPY_MODULE_DIRS)
+    list(APPEND _module_dirs ${SOAPY_MODULE_DIRS})
+endif()
+if(SOAPY_MODULE_DIR)
+    list(APPEND _module_dirs ${SOAPY_MODULE_DIR})
+endif()
+if(_module_dirs)
     set(_mod_dest "${DEST_DIR}/SoapySDR/modules0.8")
     file(MAKE_DIRECTORY "${_mod_dest}")
-    file(GLOB _modules "${SOAPY_MODULE_DIR}/*.dll")
     set(_seed_modules "")
-    foreach(_mod IN LISTS _modules)
-        get_filename_component(_modname "${_mod}" NAME)
-        file(COPY_FILE "${_mod}" "${_mod_dest}/${_modname}"
-             ONLY_IF_DIFFERENT INPUT_MAY_BE_RECENT)
-        list(APPEND _seed_modules "${_mod}")
+    foreach(_dir IN LISTS _module_dirs)
+        if(NOT EXISTS "${_dir}")
+            continue()
+        endif()
+        file(GLOB _modules "${_dir}/*.dll")
+        foreach(_mod IN LISTS _modules)
+            get_filename_component(_modname "${_mod}" NAME)
+            file(COPY_FILE "${_mod}" "${_mod_dest}/${_modname}"
+                 ONLY_IF_DIFFERENT INPUT_MAY_BE_RECENT)
+            list(APPEND _seed_modules "${_mod}")
+        endforeach()
     endforeach()
     if(_seed_modules)
         copy_mingw_closure("${DEST_DIR}" ${_seed_modules})

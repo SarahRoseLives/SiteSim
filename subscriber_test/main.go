@@ -18,7 +18,7 @@ package main
 //
 // Examples:
 //   subscriber_test -freq 145.65 -src 1234567 -tgid 100 aff
-//   subscriber_test -freq 145.65 -src 1234567 -sysid 001 reg
+//   subscriber_test -freq 145.65 -src 1234567 -sysid 123 reg
 //   subscriber_test -freq 145.65 -src 1234567 -tgid 100 -count 48 vch
 
 import (
@@ -35,7 +35,7 @@ func main() {
 	tgid     := fs.Int("tgid",   100,      "Talkgroup ID (16-bit)")
 	targetID := fs.Int("target", 2345678,  "Target unit ID for UU calls")
 	nac      := fs.Int("nac",    0x293,    "Network Access Code (12-bit)")
-	sysID    := fs.Int("sysid",  0x001,    "System ID for registration requests (12-bit)")
+	sysID    := fs.Int("sysid",  0x123,    "System ID for registration requests (12-bit)")
 	count    := fs.Int("count",  48,       "Number of frame repetitions")
 	gain     := fs.Int("gain",   40,       "TX VGA gain dB (0–47)")
 	amp      := fs.Bool("amp",   false,    "Enable HackRF built-in amplifier")

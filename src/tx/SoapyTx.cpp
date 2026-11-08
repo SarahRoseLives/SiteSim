@@ -1,7 +1,11 @@
 #include "SoapyTx.hpp"
 #include <SoapySDR/Device.hpp>
+#include <SoapySDR/Errors.hpp>
 #include <SoapySDR/Formats.hpp>
 #include <SoapySDR/Logger.hpp>
+#include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstring>
 #include <thread>
 #include <chrono>
@@ -18,11 +22,11 @@ namespace {
 // modules (SoapyHackRF / SoapyRTLSDR) live.  Point SOAPY_SDR_PLUGIN_PATH at a
 // "SoapySDR/modules0.8" directory next to the executable, unless the user has
 // already set it.  Must run before any SoapySDR call.
-void ensureSoapyPluginPath() {
-    if (const char* existing = std::getenv("SOAPY_SDR_PLUGIN_PATH");
-        existing && *existing)
-        return;
+bool dirExists(const std::wstring& path) {
+    return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
 
+void ensureSoapyPluginPath() {
     wchar_t exePath[MAX_PATH];
     DWORD n = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     if (n == 0 || n == MAX_PATH)
@@ -33,14 +37,48 @@ void ensureSoapyPluginPath() {
     if (slash == std::wstring::npos)
         return;
     dir.resize(slash);
-    std::wstring modules = dir + L"\\SoapySDR\\modules0.8";
 
-    if (GetFileAttributesW(modules.c_str()) == INVALID_FILE_ATTRIBUTES)
+    // Build a search list: bundled modules first, then PothosSDR's plugins, then
+    // whatever the environment already pointed at. SoapyPlutoSDR is usually
+    // installed by PothosSDR rather than MSYS2.
+    std::wstring paths;
+    auto add = [&paths](const std::wstring& p) {
+        if (!dirExists(p))
+            return;
+        if (!paths.empty())
+            paths += L";";
+        paths += p;
+    };
+
+    add(dir + L"\\SoapySDR\\modules0.8");
+
+    wchar_t programFiles[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"ProgramFiles", programFiles, MAX_PATH) > 0) {
+        std::wstring pf(programFiles);
+        add(pf + L"\\PothosSDR\\lib\\SoapySDR\\modules0.8");
+        add(pf + L"\\PothosSDR\\lib\\SoapySDR\\modules0.7");
+        std::wstring bin = pf + L"\\PothosSDR\\bin";
+        if (dirExists(bin)) {
+            wchar_t oldPath[32767] = {};
+            GetEnvironmentVariableW(L"PATH", oldPath, 32767);
+            std::wstring newPath = bin + L";" + oldPath;
+            SetEnvironmentVariableW(L"PATH", newPath.c_str());
+            _wputenv_s(L"PATH", newPath.c_str());
+        }
+    }
+
+    wchar_t existing[32767] = {};
+    if (GetEnvironmentVariableW(L"SOAPY_SDR_PLUGIN_PATH", existing, 32767) > 0 && existing[0]) {
+        if (!paths.empty())
+            paths += L";";
+        paths += existing;
+    }
+    if (paths.empty())
         return;
 
-    SetEnvironmentVariableW(L"SOAPY_SDR_PLUGIN_PATH", modules.c_str());
+    SetEnvironmentVariableW(L"SOAPY_SDR_PLUGIN_PATH", paths.c_str());
     // Also update the CRT environment so getenv-based lookups agree.
-    _wputenv_s(L"SOAPY_SDR_PLUGIN_PATH", modules.c_str());
+    _wputenv_s(L"SOAPY_SDR_PLUGIN_PATH", paths.c_str());
 }
 } // namespace
 #endif
@@ -76,31 +114,41 @@ std::vector<std::string> SoapyTx::listDevices() {
 
 bool SoapyTx::open(const std::string& args) {
     if (m_device) close();
+    m_args = args;
+    m_driverKey.clear();
+    m_hardwareKey.clear();
     try {
         m_device = SoapySDR::Device::make(args);
         if (!m_device) {
-            m_lastError = "SoapySDR::Device::make returned null";
+            setError("SoapySDR::Device::make returned null");
             return false;
         }
+        try { m_driverKey = m_device->getDriverKey(); } catch (...) {}
+        try { m_hardwareKey = m_device->getHardwareKey(); } catch (...) {}
         m_device->setSampleRate(SOAPY_SDR_TX, 0, m_sampleRate);
-        m_device->setFrequency(SOAPY_SDR_TX, 0, m_frequency);
+        try { m_actualSampleRate = m_device->getSampleRate(SOAPY_SDR_TX, 0); }
+        catch (...) { m_actualSampleRate = m_sampleRate; }
+        applyFrequencyChecked(m_frequency);
         m_device->setGain(SOAPY_SDR_TX, 0, m_gain);
-        // Try amp if supported
-        try {
-            m_device->setGain(SOAPY_SDR_TX, 0, "AMP", m_ampEnabled ? 14.0 : 0.0);
-        } catch (...) {}
+        // HackRF's "AMP" gain stage; other drivers may map the named setter
+        // back onto the normal gain, so only apply it on HackRF.
+        if (isHackRf()) {
+            try {
+                m_device->setGain(SOAPY_SDR_TX, 0, "AMP", m_ampEnabled ? 14.0 : 0.0);
+            } catch (...) {}
+        }
 
         m_stream = m_device->setupStream(SOAPY_SDR_TX, SOAPY_SDR_CS8);
         if (!m_stream) {
-            m_lastError = "setupStream failed";
+            setError("setupStream failed");
             SoapySDR::Device::unmake(m_device);
             m_device = nullptr;
             return false;
         }
-        m_lastError.clear();
+        setError("");
         return true;
     } catch (const std::exception& e) {
-        m_lastError = e.what();
+        setError(e.what());
         m_device = nullptr;
         return false;
     }
@@ -120,11 +168,78 @@ void SoapyTx::close() {
 
 bool SoapyTx::isOpen() const { return m_device != nullptr; }
 
-void SoapyTx::setFrequency(double hz) {
-    m_frequency = hz;
+namespace {
+std::string lowerCopy(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return char(std::tolower(c)); });
+    return s;
+}
+} // namespace
+
+bool SoapyTx::isPluto() const {
+    const std::string text = lowerCopy(m_driverKey + " " + m_hardwareKey + " " + m_args);
+    return text.find("pluto") != std::string::npos ||
+           text.find("adalm") != std::string::npos ||
+           text.find("ad936") != std::string::npos;
+}
+
+bool SoapyTx::isHackRf() const {
+    const std::string text = lowerCopy(m_driverKey + " " + m_hardwareKey + " " + m_args);
+    return text.find("hackrf") != std::string::npos;
+}
+
+bool SoapyTx::isFullDuplex() const {
     if (m_device) {
-        try { m_device->setFrequency(SOAPY_SDR_TX, 0, hz); } catch (...) {}
+        try {
+            if (m_device->getFullDuplex(SOAPY_SDR_TX, 0) &&
+                m_device->getFullDuplex(SOAPY_SDR_RX, 0))
+                return true;
+        } catch (...) {}
     }
+    return isPluto();
+}
+
+std::string SoapyTx::displayName() const {
+    if (isPluto()) return "ADALM-Pluto";
+    if (!m_driverKey.empty()) return m_driverKey;
+    return "SoapySDR";
+}
+
+bool SoapyTx::applyFrequencyChecked(double hz) {
+    if (!m_device) return false;
+
+    double actual = 0.0;
+    try {
+        m_device->setFrequency(SOAPY_SDR_TX, 0, hz);
+        actual = m_device->getFrequency(SOAPY_SDR_TX, 0);
+    } catch (const std::exception& e) {
+        std::lock_guard<std::mutex> lock(m_errMutex);
+        m_freqError = std::string("setFrequency failed: ") + e.what();
+        return false;
+    }
+
+    std::string err;
+    if (actual > 0.0 && std::abs(actual - hz) > 100e3) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "TX frequency rejected: asked for %.4f MHz, hardware is at %.4f MHz%s",
+                 hz / 1e6, actual / 1e6,
+                 isPluto() ? " (Pluto tunes ~325-3800 MHz)" : "");
+        err = buf;
+    }
+    std::lock_guard<std::mutex> lock(m_errMutex);
+    m_freqError = err;
+    return err.empty();
+}
+
+bool SoapyTx::frequencyValid() const {
+    std::lock_guard<std::mutex> lock(m_errMutex);
+    return m_freqError.empty();
+}
+
+void SoapyTx::setFrequency(double hz) {
+    m_frequency = hz + m_freqTrimHz;
+    if (m_device) applyFrequencyChecked(m_frequency);
 }
 
 void SoapyTx::setGain(double db) {
@@ -136,15 +251,19 @@ void SoapyTx::setGain(double db) {
 
 void SoapyTx::setAmpEnabled(bool en) {
     m_ampEnabled = en;
-    if (m_device) {
+    if (m_device && isHackRf()) {
         try { m_device->setGain(SOAPY_SDR_TX, 0, "AMP", en ? 14.0 : 0.0); } catch (...) {}
     }
 }
 
 void SoapyTx::setSampleRate(double sps) {
     m_sampleRate = sps;
+    m_actualSampleRate = 0.0;
     if (m_device) {
-        try { m_device->setSampleRate(SOAPY_SDR_TX, 0, sps); } catch (...) {}
+        try {
+            m_device->setSampleRate(SOAPY_SDR_TX, 0, sps);
+            m_actualSampleRate = m_device->getSampleRate(SOAPY_SDR_TX, 0);
+        } catch (...) {}
     }
 }
 
@@ -193,7 +312,15 @@ void SoapyTx::stopTx() {
 
 bool SoapyTx::isRunning() const { return m_running.load(); }
 
-std::string SoapyTx::lastError() const { return m_lastError; }
+void SoapyTx::setError(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(m_errMutex);
+    m_lastError = msg;
+}
+
+std::string SoapyTx::lastError() const {
+    std::lock_guard<std::mutex> lock(m_errMutex);
+    return m_freqError.empty() ? m_lastError : m_freqError;
+}
 
 void SoapyTx::txThread() {
     if (!m_stream || !m_device) {
@@ -211,7 +338,18 @@ void SoapyTx::txThread() {
         return;
     }
 
-    m_device->activateStream(m_stream);
+    try {
+        int rc = m_device->activateStream(m_stream);
+        if (rc != 0) {
+            setError(std::string("TX activateStream failed: ") + SoapySDR::errToStr(rc));
+            m_running.store(false);
+            return;
+        }
+    } catch (const std::exception& e) {
+        setError(std::string("TX activateStream failed: ") + e.what());
+        m_running.store(false);
+        return;
+    }
 
     static constexpr int kChunkSamples = 8192;  // IQ pairs
     static constexpr int kChunkBytes   = kChunkSamples * 2;  // int8 bytes
@@ -235,9 +373,17 @@ void SoapyTx::txThread() {
         long long timeNs = 0;
         int ret = m_device->writeStream(m_stream, ptrs, kChunkSamples, flags, timeNs, 1000000);
         if (ret < 0) {
-            // Ignore errors, keep going
+            // Timeouts are normal under backpressure; anything else is worth
+            // surfacing in the UI once.
+            if (ret != SOAPY_SDR_TIMEOUT && !m_writeErrorReported) {
+                setError(std::string("TX writeStream failed: ") + SoapySDR::errToStr(ret));
+                m_writeErrorReported = true;
+            }
+        } else if (m_writeErrorReported) {
+            setError("");
+            m_writeErrorReported = false;
         }
     }
 
-    m_device->deactivateStream(m_stream);
+    try { m_device->deactivateStream(m_stream); } catch (...) {}
 }

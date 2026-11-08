@@ -152,12 +152,42 @@ if(WIN32)
     get_filename_component(_mingw_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
     get_filename_component(_mingw_root "${_mingw_bin}" DIRECTORY)
 
-    # SoapySDR device modules (HackRF / RTL-SDR) — bundled so SiteSim can reach
-    # SDR hardware standalone. Module ABI dir is SoapySDR/modules<ABI>.
-    set(_soapy_module_dir "")
+    # SoapySDR device modules (HackRF / RTL-SDR / Pluto) — bundled so SiteSim
+    # can reach SDR hardware standalone. Module ABI dir is SoapySDR/modules<ABI>.
+    # SoapyPlutoSDR is not packaged by MSYS2, so also pick it up from PothosSDR
+    # or an explicit SOAPY_SDR_PLUGIN_PATH. Override with -DSOAPY_MODULE_DIRS=...
+    set(_soapy_module_dirs "")
+    if(DEFINED SOAPY_MODULE_DIRS)
+        list(APPEND _soapy_module_dirs ${SOAPY_MODULE_DIRS})
+    endif()
     file(GLOB _soapy_mod_dirs "${_mingw_root}/lib/SoapySDR/modules*")
-    if(_soapy_mod_dirs)
-        list(GET _soapy_mod_dirs 0 _soapy_module_dir)
+    list(APPEND _soapy_module_dirs ${_soapy_mod_dirs})
+    if(DEFINED ENV{SOAPY_SDR_PLUGIN_PATH})
+        list(APPEND _soapy_module_dirs "$ENV{SOAPY_SDR_PLUGIN_PATH}")
+    endif()
+    foreach(_cand
+        "${CMAKE_PROGRAM_PATH}/../lib/SoapySDR/modules0.8"
+        "$ENV{ProgramFiles}/PothosSDR/lib/SoapySDR/modules0.8"
+        "$ENV{ProgramFiles}/PothosSDR/lib/SoapySDR/modules0.7"
+        "$ENV{ProgramW6432}/PothosSDR/lib/SoapySDR/modules0.8")
+        if(EXISTS "${_cand}")
+            list(APPEND _soapy_module_dirs "${_cand}")
+        endif()
+    endforeach()
+    if(_soapy_module_dirs)
+        list(REMOVE_DUPLICATES _soapy_module_dirs)
+    endif()
+
+    set(_have_pluto_module FALSE)
+    foreach(_md IN LISTS _soapy_module_dirs)
+        file(GLOB _pluto_mods "${_md}/*[Pp]luto*")
+        if(_pluto_mods)
+            set(_have_pluto_module TRUE)
+        endif()
+    endforeach()
+    if(NOT _have_pluto_module)
+        message(STATUS "SiteSim: SoapyPlutoSDR module not found — install it "
+                       "(PothosSDR or source) to use an ADALM-Pluto; see COMPILE.md")
     endif()
 
     if(LDD_EXECUTABLE)
@@ -165,6 +195,19 @@ if(WIN32)
         # make the copy script search there too so it (and any of its own deps)
         # are bundled alongside the mingw DLLs.
         set(_extra_dll_dirs "${CMAKE_BINARY_DIR}/vendor-prefix/bin")
+        # A PothosSDR module dir keeps its plugin DLL dependencies in the
+        # sibling bin/ directory.
+        foreach(_md IN LISTS _soapy_module_dirs)
+            get_filename_component(_md_lib "${_md}" DIRECTORY)
+            get_filename_component(_md_root "${_md_lib}" DIRECTORY)
+            if(EXISTS "${_md_root}/bin")
+                list(APPEND _extra_dll_dirs "${_md_root}/bin")
+            endif()
+        endforeach()
+        if(_extra_dll_dirs)
+            list(REMOVE_DUPLICATES _extra_dll_dirs)
+        endif()
+
         foreach(_tgt sitesim uplink_test)
             add_custom_command(TARGET ${_tgt} POST_BUILD
                 COMMAND ${CMAKE_COMMAND}
@@ -172,7 +215,7 @@ if(WIN32)
                     -DDEST_DIR=$<TARGET_FILE_DIR:${_tgt}>
                     -DMINGW_BIN=${_mingw_bin}
                     -DLDD=${LDD_EXECUTABLE}
-                    -DSOAPY_MODULE_DIR=${_soapy_module_dir}
+                    "-DSOAPY_MODULE_DIRS=${_soapy_module_dirs}"
                     -DEXTRA_DLL_DIRS=${_extra_dll_dirs}
                     -P ${CMAKE_SOURCE_DIR}/cmake/CopyRuntimeDlls.cmake
                 VERBATIM
@@ -213,6 +256,21 @@ if(SITESIM_BUILD_SUBSCRIBER_TEST)
             set(_go_cc cc)
         endif()
 
+        # MSYS2's Go package is a trimmed toolchain and needs GOROOT pointing at
+        # <prefix>/lib/go. Keep the module/build caches inside the build tree.
+        set(_go_extra_env
+            GOTOOLCHAIN=local
+            "GOCACHE=${CMAKE_BINARY_DIR}/go-build-cache"
+            "GOPATH=${CMAKE_BINARY_DIR}/gopath"
+        )
+        if(WIN32)
+            get_filename_component(_go_bin "${GO_EXECUTABLE}" DIRECTORY)
+            get_filename_component(_go_prefix "${_go_bin}" DIRECTORY)
+            if(EXISTS "${_go_prefix}/lib/go")
+                list(APPEND _go_extra_env "GOROOT=${_go_prefix}/lib/go")
+            endif()
+        endif()
+
         # cgo needs the C compiler and (on Windows) the mingw bin dir on PATH so
         # the compiler's own DLLs resolve during the build.
         add_custom_command(
@@ -220,6 +278,7 @@ if(SITESIM_BUILD_SUBSCRIBER_TEST)
             COMMAND ${CMAKE_COMMAND} -E env
                 CGO_ENABLED=1
                 CC=${_go_cc}
+                ${_go_extra_env}
                 "PATH=${_mingw_bin}$<IF:$<BOOL:${WIN32}>,;,:>$ENV{PATH}"
                 ${GO_EXECUTABLE} build -o ${_subtest_out} .
             WORKING_DIRECTORY ${_subtest_src}

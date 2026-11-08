@@ -167,6 +167,11 @@ struct dsd_opts {
     int rtl_dsp_bw_khz;
     int rtl_bias_tee;       /* 1 to enable RTL-SDR bias tee (if supported) */
     int soapy_bandwidth_hz; /* -1=profile/default, 0=driver automatic, >0 explicit Soapy hardware bandwidth */
+    /* Exact SoapySDR RX sample rate. 0=automatic (nearest advertised rate). When
+       set, the controller requests this rate verbatim instead of snapping to the
+       driver's listSampleRates()/range, so TX and RX can share one device at a
+       mutually compatible rate. */
+    int soapy_sample_rate_hz;
     int rtl_started;
     /* Mark when RTL-SDR stream must be destroyed/recreated to apply changes
        that cannot be updated live (e.g., device index, bandwidth, manual gain). */

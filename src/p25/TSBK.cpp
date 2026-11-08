@@ -111,8 +111,16 @@ std::array<uint8_t, 12> BuildRFSSStatusBcast(uint8_t lrar, uint16_t sysID,
                                               uint8_t rfssID, uint8_t siteID,
                                               uint16_t chanID, uint16_t chanNum, uint8_t ssc) {
     uint64_t ch = (uint64_t(chanID & 0xF) << 12) | uint64_t(chanNum & 0xFFF);
+    // Byte[3] high nibble (args bits 55..52) is the CFVA flags field:
+    //   bit4 (0x10) = valid RFSS connection active  (args bit 52)
+    //   bit5 (0x20) = up to date / correct          (args bit 53)
+    // A real ASTRO 25 site sets both (0x3). Setting only the "active" bit marks
+    // the site "Last Known" and can make a subscriber reject the control
+    // channel, so set both.
+    const uint64_t networkActive = (1ull << 52) | (1ull << 53);
     uint64_t args = (uint64_t(lrar) << 56) |
                     (uint64_t(sysID & 0xFFF) << 40) |
+                    networkActive |
                     (uint64_t(rfssID) << 32) |
                     (uint64_t(siteID) << 24) |
                     (ch << 8) |
@@ -195,55 +203,106 @@ std::array<uint8_t, 12> BuildAdjStsBcast(uint16_t adjSysID, uint8_t rfssID, uint
     return buildTSBK(true, TSBK_ADJ_STS_BCAST, 0x00, args);
 }
 
+std::array<uint8_t, 12> BuildSecCcBcast(uint8_t rfssID, uint8_t siteID,
+                                        uint16_t chanID1, uint16_t chanNum1, uint8_t ssc1,
+                                        uint16_t chanID2, uint16_t chanNum2, uint8_t ssc2) {
+    uint64_t ch1 = (uint64_t(chanID1 & 0xF) << 12) | uint64_t(chanNum1 & 0xFFF);
+    uint64_t ch2 = (uint64_t(chanID2 & 0xF) << 12) | uint64_t(chanNum2 & 0xFFF);
+    // Payload bytes [2..9]: RFSS, Site, CHAN1(16), SSC1, CHAN2(16), SSC2.
+    uint64_t args = (uint64_t(rfssID) << 56) |
+                    (uint64_t(siteID) << 48) |
+                    (ch1 << 32) |
+                    (uint64_t(ssc1) << 24) |
+                    (ch2 << 8) |
+                    uint64_t(ssc2);
+    return buildTSBK(true, TSBK_SEC_CC_BCAST, 0x00, args);
+}
+
 std::array<uint8_t, 12> BuildSyncBcast() {
     const std::time_t now = std::time(nullptr);
 
     std::tm utcTm{};
-    std::tm localTm{};
     gmtimePortable(&now, &utcTm);
-    localtimePortable(&now, &localTm);
 
-    int offsetHalfHours = 0;
-#ifdef __USE_MISC
-    offsetHalfHours = static_cast<int>(localTm.tm_gmtoff / 1800);
-#endif
-    if (offsetHalfHours > 31) offsetHalfHours = 31;
-    if (offsetHalfHours < -31) offsetHalfHours = -31;
-
-    const uint8_t us = 0;
-    const uint8_t ist = 1;
-    const uint8_t mm = 0;
-    const uint8_t mc = 0;
-    const uint8_t vl = 1;
-
-    uint8_t ltoff = 0;
-    if (offsetHalfHours < 0)
-        ltoff = static_cast<uint8_t>(0x20 | (-offsetHalfHours & 0x1F));
-    else
-        ltoff = static_cast<uint8_t>(offsetHalfHours & 0x1F);
-
-    const uint8_t year  = static_cast<uint8_t>((utcTm.tm_year + 1900) % 100);
-    const uint8_t month = static_cast<uint8_t>(utcTm.tm_mon + 1);
-    const uint8_t day   = static_cast<uint8_t>(utcTm.tm_mday);
-    const uint8_t hour  = static_cast<uint8_t>(utcTm.tm_hour);
-    const uint8_t min   = static_cast<uint8_t>(utcTm.tm_min);
-    const uint16_t slots = static_cast<uint16_t>(utcTm.tm_sec * 135);
-
-    uint8_t b[8]{};
-    b[0] = 0x00;
-    b[1] = static_cast<uint8_t>((us << 3) | (ist << 2) | (mm << 1) | ((mc >> 1) & 0x01));
-    b[2] = static_cast<uint8_t>(((mc & 0x01) << 7) | (vl << 6) | ltoff);
-    b[3] = static_cast<uint8_t>((year << 1) | ((month >> 3) & 0x01));
-    b[4] = static_cast<uint8_t>(((month & 0x07) << 5) | (day & 0x1F));
-    b[5] = static_cast<uint8_t>(((hour & 0x1F) << 3) | ((min >> 3) & 0x07));
-    b[6] = static_cast<uint8_t>(((min & 0x07) << 5) | ((slots >> 8) & 0x1F));
-    b[7] = static_cast<uint8_t>(slots & 0xFF);
-
+    // TIA-102.AABC SYNC_BCAST payload (message bits 16..79 = args bits 63..0):
+    //   29      system time not locked to external reference
+    //   30      micro-slot/minute rollover unlocked
+    //   31-32   leap second correction
+    //   33      local time offset valid (0 = valid)
+    //   34      local time offset sign
+    //   35-38   local time offset hours
+    //   39      local time offset half hour
+    //   40-46   year - 2000
+    //   47-50   month (1-12)
+    //   51-55   day
+    //   56-60   hours
+    //   61-66   minutes
+    //   67-79   micro-slots since minute rollover (7.5 ms units)
     uint64_t args = 0;
-    for (int i = 0; i < 8; ++i)
-        args = (args << 8) | b[i];
+    auto put = [&args](int msbMsg, int lsbMsg, uint64_t value) {
+        const int shift = 79 - lsbMsg;
+        const int nbits = lsbMsg - msbMsg + 1;
+        const uint64_t mask = (nbits >= 64) ? ~0ull : ((1ull << nbits) - 1ull);
+        args |= (value & mask) << shift;
+    };
+
+    const uint64_t year     = uint64_t((utcTm.tm_year + 1900 - 2000) & 0x7F);
+    const uint64_t month    = uint64_t(utcTm.tm_mon + 1) & 0x0F;
+    const uint64_t day      = uint64_t(utcTm.tm_mday) & 0x1F;
+    const uint64_t hours    = uint64_t(utcTm.tm_hour) & 0x1F;
+    const uint64_t minutes  = uint64_t(utcTm.tm_min) & 0x3F;
+    uint64_t microSlots     = uint64_t((utcTm.tm_sec * 8000) / 60);
+    if (microSlots > 7999) microSlots = 7999;
+
+    put(29, 29, 0);          // locked to external reference
+    put(30, 30, 0);          // micro-slot/minute rollover locked
+    put(31, 32, 0);          // no leap second correction
+    put(33, 33, 0);          // local time offset valid (0 = valid)
+    put(34, 34, 0);          // offset sign: positive
+    put(35, 38, 0);          // offset hours: 0 (UTC)
+    put(39, 39, 0);          // offset half hour: 0
+    put(40, 46, year);       // 7 bits
+    put(47, 50, month);      // 4 bits
+    put(51, 55, day);        // 5 bits
+    put(56, 60, hours);      // 5 bits
+    put(61, 66, minutes);    // 6 bits
+    put(67, 79, microSlots); // 13 bits
 
     return buildTSBK(true, TSBK_SYNC_BCAST, 0x00, args);
+}
+
+// Motorola-proprietary station messages (MFID 0x90).  Argument byte layout used
+// by these opcodes: args bits [63:16] -> payload bytes [2..7], args [15:0] ->
+// bytes [8..9] (buildTSBK stores args MSB-first into bytes 2..9).
+std::array<uint8_t, 12> BuildMotoBaseStationId(uint8_t iden, uint16_t chanNum,
+                                               const char* cwid) {
+    // CWID: eight 6-bit fields packed MSB-first into 48 bits. Field i occupies
+    // bits (42 - 6*i)..(37 - 6*i) of the value carried in bytes[2..7].
+    uint64_t cwidBits = 0;
+    if (cwid) {
+        int n = 0;
+        for (const char* p = cwid; *p && n < 8; ++p, ++n) {
+            uint64_t v = uint64_t(uint8_t(uint8_t(*p) - 43u) & 0x3F);
+            cwidBits |= v << (42 - 6 * n);
+        }
+    }
+    // 16-bit channel field: 4-bit IDEN in the high nibble, 12-bit number low.
+    uint64_t channel = (uint64_t(iden & 0xF) << 12) | uint64_t(chanNum & 0xFFF);
+    uint64_t args = (cwidBits << 16) | channel;
+    return buildTSBK(true, TSBK_MOTO_BASE_STATION_ID, TSBK_MFID_MOTOROLA, args);
+}
+
+std::array<uint8_t, 12> BuildMotoTrafficChannelId(uint64_t msg) {
+    return buildTSBK(true, TSBK_MOTO_TRAFFIC_CHAN_ID, TSBK_MFID_MOTOROLA, msg);
+}
+
+std::array<uint8_t, 12> BuildMotoScanMarker(uint8_t mk, uint8_t ms, uint16_t value) {
+    // byte[2] high nibble = marker key, byte[3] = marker segment,
+    // bytes[4..5] = 16-bit value, bytes[6..9] zero.
+    uint64_t byte2 = uint64_t((mk & 0x0F) << 4);
+    uint64_t byte3 = uint64_t(ms & 0xFF);
+    uint64_t args = (byte2 << 56) | (byte3 << 48) | (uint64_t(value) << 32);
+    return buildTSBK(true, TSBK_MOTO_SCAN_MARKER, TSBK_MFID_MOTOROLA, args);
 }
 
 } // namespace p25

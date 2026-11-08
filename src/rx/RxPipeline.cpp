@@ -1,6 +1,7 @@
 #include "rx/RxPipeline.hpp"
 #include "p25/TSBK.hpp"
 
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -11,6 +12,8 @@
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/engine/engine.h>
+#include <dsd-neo/io/rtl_demod_config.h>
+#include <dsd-neo/io/rtl_device.h>
 #include <dsd-neo/runtime/exitflag.h>
 #include <dsd-neo/runtime/p25_isp_hooks.h>
 #include <dsd-neo/runtime/p25_optional_hooks.h>
@@ -56,6 +59,50 @@ RxPipeline::~RxPipeline()
 void RxPipeline::configure(const SiteConfig& cfg)
 {
     m_cfg = cfg;
+    m_cfg.normalizeChannelPlan();
+}
+
+void RxPipeline::useRtlsdrSource()
+{
+    m_soapy          = false;
+    m_shareDevice    = false;
+    m_externalDevice = nullptr;
+    m_soapyArgs.clear();
+    m_soapyProfile.clear();
+    m_soapyRate      = 0;
+}
+
+void RxPipeline::useSoapySource(const std::string& args, const std::string& profile,
+                                uint32_t sampleRateHz)
+{
+    m_soapy          = true;
+    m_shareDevice    = false;
+    m_externalDevice = nullptr;
+    m_soapyArgs      = args;
+    m_soapyProfile   = profile;
+    m_soapyRate      = sampleRateHz;
+}
+
+void RxPipeline::useSharedSoapyDevice(void* device, const std::string& args,
+                                      const std::string& profile, uint32_t sampleRateHz)
+{
+    m_soapy          = true;
+    m_shareDevice    = true;
+    m_externalDevice = device;
+    m_soapyArgs      = args;
+    m_soapyProfile   = profile;
+    m_soapyRate      = sampleRateHz;
+}
+
+std::string RxPipeline::sourceName() const
+{
+    if (!m_soapy) return "RTL-SDR";
+    std::string text = m_soapyProfile + " " + m_soapyArgs;
+    for (auto& ch : text) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    if (text.find("pluto") != std::string::npos || text.find("adalm") != std::string::npos ||
+        text.find("ad936") != std::string::npos)
+        return "ADALM-Pluto";
+    return "SoapySDR";
 }
 
 bool RxPipeline::start()
@@ -70,12 +117,31 @@ bool RxPipeline::start()
 
     // ── RTL-SDR input ──────────────────────────────────────────────────────
     m_opts->audio_in_type       = AUDIO_IN_RTL;
-    snprintf(m_opts->audio_in_dev, sizeof(m_opts->audio_in_dev), "rtl");
+    if (m_soapy) {
+        if (m_soapyArgs.empty())
+            snprintf(m_opts->audio_in_dev, sizeof(m_opts->audio_in_dev), "soapy");
+        else
+            snprintf(m_opts->audio_in_dev, sizeof(m_opts->audio_in_dev), "soapy:%s", m_soapyArgs.c_str());
+        snprintf(m_opts->soapy_profile, sizeof(m_opts->soapy_profile), "%s", m_soapyProfile.c_str());
+        m_opts->soapy_sample_rate_hz = static_cast<int>(m_soapyRate);
+    } else {
+        snprintf(m_opts->audio_in_dev, sizeof(m_opts->audio_in_dev), "rtl");
+        m_opts->rtl_dev_index       = 0;
+    }
     m_opts->rtlsdr_center_freq  = static_cast<uint32_t>(m_cfg.rxFreqHz());
     m_opts->rtl_gain_value      = 0;     // 0 = AGC (auto-gain)
     m_opts->rtlsdr_ppm_error    = 0;     // no manual PPM correction
     m_opts->rtl_dsp_bw_khz      = 24;    // 24 kHz -> 5 samples/symbol for P25P1
-    m_opts->rtl_dev_index       = 0;
+
+    // Zero-IF Soapy SDRs (Pluto) should tune directly to the signal. dsd-neo's
+    // fs/4 fallback moves the LO 384 kHz off-center, which the narrow Soapy RF
+    // bandwidth then rejects. Native RTL keeps the default fs/4 behavior.
+    disable_fs4_shift = m_soapy ? 1 : 0;
+
+    // On full-duplex radios the transmitter owns the Soapy device; hand that
+    // same handle to dsd-neo so RX shares it instead of opening a second one.
+    rtl_device_set_external_soapy_device(
+        (m_soapy && m_shareDevice) ? m_externalDevice : nullptr);
 
     // ── P25 Phase 1 only — disable all other protocols to prevent crashes ──
     // (other decoders call private vocoder stubs that can't safely execute)
@@ -111,8 +177,8 @@ bool RxPipeline::start()
     startStderrCapture();
 
     char startMsg[128];
-    snprintf(startMsg, sizeof(startMsg), "RX started — RTL-SDR @ %.4f MHz (P25P1 ISP mode)",
-             m_cfg.rxFreqHz() / 1e6);
+    snprintf(startMsg, sizeof(startMsg), "RX started — %s @ %.4f MHz (P25P1 ISP mode)",
+             sourceName().c_str(), m_cfg.rxFreqHz() / 1e6);
     m_log(startMsg);
 
     m_thread = std::thread(&RxPipeline::engineThread, this);
@@ -121,11 +187,14 @@ bool RxPipeline::start()
 
 void RxPipeline::stop()
 {
-    if (!m_running.load()) return;
     m_running.store(false);
-    exitflag = 1;          // signals dsd_engine_run() to exit its loop
-    if (m_thread.joinable())
+    if (m_thread.joinable()) {
+        exitflag = 1;      // signals dsd_engine_run() to exit its loop
         m_thread.join();
+    }
+
+    // RX is done with the borrowed device; the transmitter still owns it.
+    rtl_device_set_external_soapy_device(nullptr);
 
     stopStderrCapture();
 
@@ -167,12 +236,22 @@ void RxPipeline::handleIspTsbk(uint8_t opcode, const uint8_t raw12[12])
     switch (opcode) {
 
     case P25_ISP_GRP_VCH_REQ: {
-        // Queue a Group Voice Channel Grant response
+        // Grant the voice channel selected in the site's channel plan.
         bool emrg = (options >> 7) & 1;
-        snprintf(buf, sizeof(buf), "GRP_VCH_REQ  SRC:%-8u TGID:%-5u%s",
-                 src_id, tgid, emrg ? " [EMRG]" : "");
+        auto grant = p25::BuildGrpVChGrant(
+            emrg ? 0x80 : 0x00,
+            m_cfg.chanId,
+            m_cfg.vChanNum,
+            static_cast<uint16_t>(tgid),
+            src_id);
+        m_cc.queueTSBK(grant);
+
+        snprintf(buf, sizeof(buf),
+                 "GRP_VCH_REQ  SRC:%-8u TGID:%-5u%s -> granted VC %.5f MHz (IDEN %u ch %u)",
+                 src_id, tgid, emrg ? " [EMRG]" : "",
+                 m_cfg.channelFrequency(m_cfg.vChanNum) / 1e6,
+                 unsigned(m_cfg.chanId), unsigned(m_cfg.vChanNum));
         m_log(buf);
-        // TODO: allocate a voice channel and queue GRP_VCH_GRANT TSBK
         break;
     }
 
@@ -319,6 +398,49 @@ RxPipeline::~RxPipeline()
 void RxPipeline::configure(const SiteConfig& cfg)
 {
     m_cfg = cfg;
+    m_cfg.normalizeChannelPlan();
+}
+
+void RxPipeline::useRtlsdrSource()
+{
+    m_soapy = false;
+    m_shareDevice = false;
+    m_externalDevice = nullptr;
+    m_soapyArgs.clear();
+    m_soapyProfile.clear();
+    m_soapyRate = 0;
+}
+
+void RxPipeline::useSoapySource(const std::string& args, const std::string& profile,
+                                uint32_t sampleRateHz)
+{
+    m_soapy = true;
+    m_shareDevice = false;
+    m_externalDevice = nullptr;
+    m_soapyArgs = args;
+    m_soapyProfile = profile;
+    m_soapyRate = sampleRateHz;
+}
+
+void RxPipeline::useSharedSoapyDevice(void* device, const std::string& args,
+                                      const std::string& profile, uint32_t sampleRateHz)
+{
+    m_soapy = true;
+    m_shareDevice = true;
+    m_externalDevice = device;
+    m_soapyArgs = args;
+    m_soapyProfile = profile;
+    m_soapyRate = sampleRateHz;
+}
+
+std::string RxPipeline::sourceName() const
+{
+    if (!m_soapy) return "RTL-SDR";
+    std::string text = m_soapyProfile + " " + m_soapyArgs;
+    for (auto& ch : text) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    if (text.find("pluto") != std::string::npos)
+        return "ADALM-Pluto";
+    return "SoapySDR";
 }
 
 bool RxPipeline::start()

@@ -68,20 +68,53 @@ When a valid uplink request is decoded, SiteSim can generate a matching control-
 For example:
 
 - a `GRP_AFF_REQ` can cause a `GRP_AFF_RSP` to be queued
+- a `GRP_VCH_REQ` causes a `GRP_VCH_GRANT` for the selected voice channel
 - a `U_REG_REQ` can cause a `U_REG_RSP` to be queued
 
 This means the uplink side and downlink side are tied together: subscriber actions heard on the uplink can immediately drive site behavior on the control channel.
 
 ## 4. Frequency model
 
-The site configuration carries both the control-channel transmit frequency and the uplink receive frequency relationship.
+SiteSim uses an editable **channel plan** instead of two fixed frequency boxes.
+Add as many 2m/70cm channels as you need, then click the **CC** radio button on
+the row the site should transmit on and the **VC** radio button on the voice
+channel it should grant:
 
-`SiteSim` models this using a control-channel frequency plus an offset. That makes it possible to represent:
+- **CC** — the control-channel transmit frequency.
+- **VC** — the voice channel advertised in `IDEN_UP` and returned in
+  `GRP_VCH_GRANT` responses.
+- **Uplink / Site Input** — an explicit frequency for radio → site traffic
+  (affiliation, registration, voice requests). This is where the RX radio
+  tunes. The TX offset sent in `IDEN_UP` is derived from
+  `uplink − control channel`; editing the control channel preserves that
+  offset, and editing the uplink changes it.
 
-- the frequency the site is transmitting on
-- the frequency subscriber units are expected to transmit back on
+The `IDEN_UP` band plan is derived automatically from the lowest frequency in
+the plan and the selected spacing (6.25/12.5/25 kHz). The UI shows the resolved
+channel numbers and refuses to apply/start if a channel is outside the amateur
+bands or does not fit in the 4095-step IDEN range. Defaults are SYSID `0x123`,
+a 12.5 kHz 70cm plan (control `438.8000`, voice `438.8125`, `438.8250`,
+`438.8375` MHz), and a −5 MHz uplink split (`433.8000` MHz). Edit the uplink
+field for your repeater's actual input; the offset sent in `IDEN_UP` follows.
 
-This matters because the control channel and the uplink receiver are not necessarily listening on the same RF frequency.
+## 5. Radio backends
+
+SiteSim uses SoapySDR for the transmitter and dsd-neo for the uplink receiver.
+
+- **HackRF + RTL-SDR (default):** the control channel transmits on the SoapySDR
+  device (HackRF), while the uplink receiver runs on a separate RTL-SDR via
+  dsd-neo's native librtlsdr path.
+- **ADALM-Pluto (single radio, full duplex):** the Pluto performs both jobs at
+  once. SiteSim opens one SoapySDR device, keeps the TX stream, and hands the
+  same device handle to dsd-neo for RX. TX and RX are tuned independently
+  (control channel vs. site input) and both run at 1.536 MS/s so the AD9361
+  baseband rate is shared. The Pluto is preferred automatically when present;
+  the **Device** menu lets you choose another SoapySDR device.
+
+SoapyPlutoSDR is not part of MSYS2; see `COMPILE.md` for installation details.
+Note that the stock Pluto's AD9363 tunes about **325 MHz–3.8 GHz**, so the 2m
+band is not usable without an upconverter; use 70cm (420–450 MHz). SiteSim
+verifies the tuned frequency and will not key TX if the hardware rejects it.
 
 ## How `uplink_test` fits in
 

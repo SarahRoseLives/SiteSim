@@ -8,9 +8,22 @@
 #include "imgui_impl_opengl3.h"
 #include <SDL.h>
 #include <SDL_opengl.h>
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cmath>
 #include <memory>
+
+namespace {
+bool deviceArgsLookLikePluto(const std::string& args) {
+    std::string s = args;
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return char(std::tolower(c)); });
+    return s.find("pluto") != std::string::npos ||
+           s.find("adalm") != std::string::npos ||
+           s.find("ad936") != std::string::npos;
+}
+} // namespace
 
 App::App() : m_cc(m_tx), m_rx(m_cc, [this](const std::string&) {}) {}
 
@@ -76,30 +89,114 @@ bool App::init() {
     ImGui_ImplSDL2_InitForOpenGL(m_window, m_glCtx);
     ImGui_ImplOpenGL3_Init("#version 330 core");
 
-    m_deviceList = m_tx.listDevices();
+    // SoapySDR enumeration can take 20-30 s when it probes network SDRs. Do it
+    // on a worker so the window paints immediately; run() shows a splash until
+    // the scan finishes.
+    startDeviceScan();
+    return true;
+}
 
-    // Auto-open first real device found
-    bool opened = false;
-    for (const auto& dev : m_deviceList) {
-        if (dev.find("(no device") == std::string::npos) {
-            if (m_tx.open(dev)) {
-                m_statusMsg = "Device ready: " + dev;
-                opened = true;
-            } else {
-                m_statusMsg = "Device open failed: " + m_tx.lastError();
+void App::startDeviceScan() {
+    m_scanActive = true;
+    m_scanDone.store(false, std::memory_order_release);
+    m_pendingDeviceList.clear();
+    m_pendingPick   = -1;
+    m_pendingOpenOk = false;
+    m_pendingError.clear();
+    m_statusMsg     = "Scanning for SDR devices...";
+
+    m_scanThread = std::thread([this] {
+        m_pendingDeviceList = m_tx.listDevices();
+
+        // Prefer a full-duplex Pluto if one is present, otherwise the first
+        // real Soapy device. (HackRF/RTL-SDR keep TX + native RTL RX.)
+        int pick = -1;
+        for (size_t i = 0; i < m_pendingDeviceList.size(); i++) {
+            std::string s = m_pendingDeviceList[i];
+            std::transform(s.begin(), s.end(), s.begin(),
+                           [](unsigned char c) { return char(std::tolower(c)); });
+            if (s.find("(no device") != std::string::npos) continue;
+            if (pick < 0) pick = int(i);
+            if (s.find("pluto") != std::string::npos ||
+                s.find("adalm") != std::string::npos ||
+                s.find("plutosdr") != std::string::npos) {
+                pick = int(i);
+                break;
             }
-            break;
+        }
+        m_pendingPick = pick;
+
+        if (pick >= 0) {
+            const std::string args = m_pendingDeviceList[size_t(pick)];
+            m_tx.setSampleRate(deviceArgsLookLikePluto(args) ? 1536000.0 : 2400000.0);
+            m_pendingOpenOk = m_tx.open(args);
+            if (!m_pendingOpenOk) m_pendingError = m_tx.lastError();
+        }
+        m_scanDone.store(true, std::memory_order_release);
+    });
+}
+
+void App::finishDeviceScan() {
+    if (m_scanThread.joinable()) m_scanThread.join();
+    m_deviceList = std::move(m_pendingDeviceList);
+
+    if (m_pendingPick >= 0) {
+        if (m_pendingOpenOk) {
+            applyRadioConfig();
+        } else {
+            m_statusMsg = "Device open failed: " + m_pendingError;
+        }
+    } else {
+        m_statusMsg = "No SDR device found - simulation mode";
+    }
+    m_scanActive = false;
+}
+
+void App::renderLoadingSplash() {
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->WorkPos);
+    ImGui::SetNextWindowSize(vp->WorkSize);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::Begin("##ScanSplash", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking);
+    ImGui::PopStyleVar();
+
+    const ImVec2 size = ImGui::GetWindowSize();
+    ImGui::SetCursorPos(ImVec2(size.x * 0.5f - 160.0f, size.y * 0.5f - 20.0f));
+    ImGui::BeginGroup();
+    ImGui::TextColored(ImVec4(0.29f, 0.62f, 1.0f, 1.0f), "SiteSim");
+    ImGui::TextUnformatted("Scanning for SDR devices...");
+    ImGui::TextDisabled("This can take a while while network SDRs are probed.");
+    ImGui::EndGroup();
+
+    ImGui::End();
+}
+
+void App::applyRadioConfig() {
+    if (m_tx.isOpen() && m_tx.isPluto()) {
+        // ADALM-Pluto: one device serves TX and RX. 1.536 MS/s = 320 samples
+        // per symbol, and dsd-neo's 24 kHz DSP path also lands on 24 kHz after
+        // a /64 decimation, so both directions share the AD9361 baseband rate.
+        constexpr uint32_t kPlutoRate = 1536000;
+        m_tx.setSampleRate(double(kPlutoRate));
+        m_rx.useSharedSoapyDevice(m_tx.device(), m_tx.argsString(), "pluto", kPlutoRate);
+        m_statusMsg = "Full-duplex Pluto ready: " + m_tx.displayName();
+    } else {
+        m_rx.useRtlsdrSource();
+        if (m_tx.isOpen()) {
+            m_tx.setSampleRate(2400000.0);
+            m_statusMsg = "Device ready: " + m_tx.displayName() + " (RTL-SDR RX)";
+        } else {
+            m_statusMsg = "No SDR device found - simulation mode";
         }
     }
-    if (!opened && m_tx.lastError().empty())
-        m_statusMsg = "No SDR device found - simulation mode";
-
-    return true;
 }
 
 void App::run() {
     // Panels live here so they capture references correctly
-    SitePanel sitePanel(m_cc, m_tx);
+    SitePanel sitePanel(m_cc, m_tx, m_rx);
     CCPanel   ccPanel(m_cc, m_tx, m_rx);
     LogPanel  logPanel(m_cc);
 
@@ -121,13 +218,20 @@ void App::run() {
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
-        setupDocking();
-        renderMenuBar();
-        renderStatusBar();
+        if (m_scanActive && m_scanDone.load(std::memory_order_acquire))
+            finishDeviceScan();
 
-        sitePanel.render();
-        ccPanel.render(sitePanel.config());
-        logPanel.render();
+        if (m_scanActive) {
+            renderLoadingSplash();
+        } else {
+            setupDocking();
+            renderMenuBar();
+            renderStatusBar();
+
+            sitePanel.render();
+            ccPanel.render(sitePanel.config());
+            logPanel.render();
+        }
 
         ImGui::Render();
         ImGuiIO& io = ImGui::GetIO();
@@ -172,7 +276,7 @@ void App::setupDocking() {
         ImGui::DockBuilderSetNodeSize(dockId, size);
 
         ImGuiID left, right;
-        ImGui::DockBuilderSplitNode(dockId, ImGuiDir_Left, 0.22f, &left, &right);
+        ImGui::DockBuilderSplitNode(dockId, ImGuiDir_Left, 0.30f, &left, &right);
         ImGuiID rightTop, rightBottom;
         ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.40f, &rightBottom, &rightTop);
 
@@ -201,11 +305,17 @@ void App::renderMenuBar() {
             }
             ImGui::Separator();
             for (size_t i = 0; i < m_deviceList.size(); i++) {
-                bool isCurrent = m_tx.isOpen() && (i == 0); // simple: first = active
+                bool isCurrent = m_tx.isOpen() && (m_deviceList[i] == m_tx.argsString());
                 if (ImGui::MenuItem(m_deviceList[i].c_str(), nullptr, isCurrent)) {
+                    // Stop RX before closing the device: on a shared Pluto the
+                    // RX stream is using this same handle.
+                    if (m_rx.isRunning()) m_rx.stop();
+                    if (m_cc.isRunning()) m_cc.stop();
+                    m_tx.stopTx();
                     m_tx.close();
+                    m_tx.setSampleRate(deviceArgsLookLikePluto(m_deviceList[i]) ? 1536000.0 : 2400000.0);
                     if (m_tx.open(m_deviceList[i]))
-                        m_statusMsg = "Opened: " + m_deviceList[i];
+                        applyRadioConfig();
                     else
                         m_statusMsg = "Failed: " + m_tx.lastError();
                 }
@@ -246,14 +356,18 @@ void App::renderStatusBar() {
     ImGui::SameLine();
     bool devOpen = m_tx.isOpen();
     ImVec4 dotCol = devOpen ? ImVec4(0.2f, 1.0f, 0.4f, 1.0f) : ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
-    float dotW = ImGui::CalcTextSize("[*] HackRF").x + 12.0f;
+    std::string devLabel = devOpen ? ("[*] " + m_tx.displayName()) : std::string("[ ] No Device");
+    float dotW = ImGui::CalcTextSize(devLabel.c_str()).x + 12.0f;
     ImGui::SetCursorPosX(ImGui::GetWindowWidth() - dotW);
-    ImGui::TextColored(dotCol, devOpen ? "[*] HackRF" : "[ ] No Device");
+    ImGui::TextColored(dotCol, "%s", devLabel.c_str());
 
     ImGui::End();
 }
 
 void App::shutdown() {
+    // If the window is closed during the initial device scan, wait for the
+    // worker before touching m_tx from this thread.
+    if (m_scanThread.joinable()) m_scanThread.join();
     if (m_rx.isRunning()) m_rx.stop();
     if (m_cc.isRunning()) m_cc.stop();
     m_tx.stopTx();

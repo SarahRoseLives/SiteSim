@@ -27,6 +27,7 @@
 #include "p25p1_tsbk_isp.h"
 #include <dsd-neo/protocol/p25/p25_vpdu.h>
 #include <dsd-neo/runtime/colors.h>
+#include <dsd-neo/runtime/p25_isp_hooks.h>
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1055,6 +1056,13 @@ tsbk_dispatch_message(dsd_opts* opts, dsd_state* state, const tsbk_decode_ctx_t*
 
     if (protectbit == 1) {
         if (MFID < 0x2) {
+            /* SiteSim: real subscribers send inbound ISP messages as protected
+             * TSBKs, so surface them through the same ISP hook as the clear
+             * path. Without this a site simulator never sees a real radio's
+             * affiliation/registration request and cannot answer it. */
+            if (opts->p25_isp_mode) {
+                dsd_p25_isp_hook_on_tsbk((uint8_t)(ctx->tsbk_byte[0] & 0x3F), ctx->tsbk_byte);
+            }
             tsbk_handle_isp_messages(ctx->tsbk_byte);
         } else if (MFID == 0x90) {
             tsbk_handle_mfid90_isp_messages(ctx->tsbk_byte);

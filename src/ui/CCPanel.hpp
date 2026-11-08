@@ -3,6 +3,8 @@
 #include "tx/SoapyTx.hpp"
 #include "rx/RxPipeline.hpp"
 
+#include <string>
+
 class CCPanel {
 public:
     CCPanel(ControlChannel& cc, SoapyTx& tx, RxPipeline& rx);
@@ -12,4 +14,5 @@ private:
     ControlChannel& m_cc;
     SoapyTx&        m_tx;
     RxPipeline&     m_rx;
+    std::string     m_startError;
 };

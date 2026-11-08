@@ -39,6 +39,21 @@ public:
     bool isRunning() const { return m_running.load(); }
     void setLogCallback(LogCallback log) { m_log = std::move(log); }
 
+    // ── RX source selection ────────────────────────────────────────────────
+    // Default is the native librtlsdr path (HackRF TX + RTL-SDR RX setup).
+    void useRtlsdrSource();
+    // Open the RX device through SoapySDR (e.g. an ADALM-Pluto used for RX
+    // only, as in uplink_test).
+    void useSoapySource(const std::string& args, const std::string& profile,
+                        uint32_t sampleRateHz);
+    // Share an already-open SoapySDR device owned by the transmitter, so one
+    // full-duplex radio serves both TX and RX.
+    void useSharedSoapyDevice(void* device, const std::string& args,
+                              const std::string& profile, uint32_t sampleRateHz);
+
+    bool isSoapy() const { return m_soapy; }
+    std::string sourceName() const;
+
 private:
     static void engineThread(RxPipeline* self);
 
@@ -54,6 +69,13 @@ private:
     ControlChannel& m_cc;
     LogCallback     m_log;
     SiteConfig      m_cfg;
+
+    bool         m_soapy          = false;
+    bool         m_shareDevice    = false;
+    void*        m_externalDevice = nullptr;
+    std::string  m_soapyArgs;
+    std::string  m_soapyProfile;
+    uint32_t     m_soapyRate      = 0;
 
     dsd_opts* m_opts  = nullptr;
     dsd_state* m_state = nullptr;

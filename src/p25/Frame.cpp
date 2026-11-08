@@ -35,12 +35,21 @@ std::vector<uint8_t> insertStatusSymbols(const std::vector<uint8_t>& data, uint8
     std::vector<uint8_t> out;
     out.reserve(data.size() + numSS + 35);
 
+    // Slotted ALOHA: the first status symbol of the OSP announces the start of
+    // the inbound slot (0b11 = idle); the remaining microslots are
+    // "between slot boundaries" (0b10). Emitting a constant value never gives
+    // a subscriber a usable inbound slot and it will not transmit.
     int remaining = numSS;
+    int ssIndex   = 0;
+    auto nextStatus = [&]() -> uint8_t {
+        return (ssIndex++ == 0) ? ss : kTSCCStatusBetween;
+    };
+
     int i = 1;
     for (uint8_t d : data) {
         out.push_back(d);
         if (i % 35 == 0 && remaining > 0) {
-            out.push_back(ss);
+            out.push_back(nextStatus());
             remaining--;
         }
         i++;
@@ -49,7 +58,7 @@ std::vector<uint8_t> insertStatusSymbols(const std::vector<uint8_t>& data, uint8
     while (remaining > 0) {
         out.push_back(0);
         if (i % 35 == 0) {
-            out.push_back(ss);
+            out.push_back(nextStatus());
             remaining--;
         }
         i++;
