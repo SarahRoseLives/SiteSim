@@ -1,10 +1,19 @@
 #include "rx/RxPipeline.hpp"
+#include "rx/P25Receiver.hpp"
 #include "p25/TSBK.hpp"
 
 #include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <complex>
+#include <cmath>
+#include <vector>
+#include <stdexcept>
+
+#include <rtl-sdr.h>
+#include <SoapySDR/Device.hpp>
+#include <SoapySDR/Formats.hpp>
 
 #if SITESIM_HAVE_DSDNEO
 
@@ -109,11 +118,10 @@ void RxPipeline::useRtlsdrSource()
     m_soapyArgs.clear();
     m_soapyProfile.clear();
     m_soapyRate      = 0;
-#if defined(_WIN32)
-    // Prefer the known-good external decoder for RTL RX. The vendored
-    // in-process dsd-neo (v2.3.0) does not decode P25P1 reliably.
-    m_useExternal = externalDecoderAvailable();
-#endif
+    // Native in-process P25 receiver fed from librtlsdr.
+    m_useNative       = true;
+    m_nativeRate      = 1536000;
+    m_nativeOffsetHz  = 180000;
 }
 
 void RxPipeline::useSoapySource(const std::string& args, const std::string& profile,
@@ -125,6 +133,9 @@ void RxPipeline::useSoapySource(const std::string& args, const std::string& prof
     m_soapyArgs      = args;
     m_soapyProfile   = profile;
     m_soapyRate      = sampleRateHz;
+    m_useNative      = true;
+    m_nativeRate     = sampleRateHz ? sampleRateHz : 1536000;
+    m_nativeOffsetHz = 180000;
 }
 
 void RxPipeline::useSharedSoapyDevice(void* device, const std::string& args,
@@ -136,6 +147,9 @@ void RxPipeline::useSharedSoapyDevice(void* device, const std::string& args,
     m_soapyArgs      = args;
     m_soapyProfile   = profile;
     m_soapyRate      = sampleRateHz;
+    m_useNative      = true;
+    m_nativeRate     = sampleRateHz ? sampleRateHz : 1536000;
+    m_nativeOffsetHz = 180000;
 }
 
 std::string RxPipeline::sourceName() const
@@ -163,12 +177,10 @@ bool RxPipeline::start()
     }
 
     // Allocate and initialise dsd-neo state
-#if defined(_WIN32)
-    if (m_useExternal) {
-        startExternalDecoder();
+    if (m_useNative) {
+        startNative();
         return m_running.load();
     }
-#endif
     m_opts  = new dsd_opts{};
     m_state = new dsd_state{};
     initOpts(m_opts);
@@ -287,6 +299,11 @@ bool RxPipeline::start()
 
 void RxPipeline::stop()
 {
+    if (m_useNative) {
+        stopNative();
+        m_running.store(false);
+        return;
+    }
 #if defined(_WIN32)
     if (m_useExternal) {
         stopExternalDecoder();
@@ -427,6 +444,156 @@ void RxPipeline::handleIspTsbk(uint8_t opcode, const uint8_t raw12[12])
 }
 
 // ── dsd-neo event log callback ────────────────────────────────────────────────
+
+// ── Native in-process P25 receiver (p25rx::P25Receiver) ──────────────────────
+
+void RxPipeline::onNativeTsbk(const uint8_t tsbk[12])
+{
+    if (g_rx_logfile) {
+        fprintf(g_rx_logfile,
+                "TSBK op=0x%02X raw=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                tsbk[0] & 0x3F, tsbk[0], tsbk[1], tsbk[2], tsbk[3], tsbk[4], tsbk[5],
+                tsbk[6], tsbk[7], tsbk[8], tsbk[9], tsbk[10], tsbk[11]);
+        fflush(g_rx_logfile);
+    }
+    handleIspTsbk(uint8_t(tsbk[0] & 0x3F), tsbk);
+}
+
+void RxPipeline::startNative()
+{
+    if (m_running.load()) return;
+
+    m_rx = new p25rx::P25Receiver();
+    m_rx->configure(double(m_nativeRate), m_cfg.nac);
+    m_rx->setMixOffset(double(m_nativeOffsetHz));
+    m_rx->setSsInterval(35);
+    m_rx->setTsbkCallback([this](const std::array<uint8_t, 12>& t) { onNativeTsbk(t.data()); });
+
+    if (!g_rx_logfile)
+        g_rx_logfile = fopen(rx_logfile_path(), "w");
+
+    m_nativeStop.store(false);
+    m_running.store(true);
+    if (m_log) {
+        char m[192];
+        snprintf(m, sizeof(m), "RX started (native P25 receiver) %s @ %.4f MHz",
+                 sourceName().c_str(), m_cfg.rxFreqHz() / 1e6);
+        m_log(m);
+    }
+    m_nativeThread = std::thread(m_soapy ? &RxPipeline::nativeSoapyThread
+                                         : &RxPipeline::nativeRtlThread, this);
+}
+
+void RxPipeline::stopNative()
+{
+    m_nativeStop.store(true);
+    if (m_nativeThread.joinable()) m_nativeThread.join();
+    delete m_rx;
+    m_rx = nullptr;
+    if (g_rx_logfile) { fflush(g_rx_logfile); fclose(g_rx_logfile); g_rx_logfile = nullptr; }
+    m_running.store(false);
+}
+
+void RxPipeline::nativeRtlThread(RxPipeline* self)
+{
+    rtlsdr_dev_t* dev = nullptr;
+    if (rtlsdr_open(&dev, 0) < 0) {
+        if (self->m_log) self->m_log("RX: rtlsdr_open failed (device busy?)");
+        self->m_running.store(false);
+        return;
+    }
+    rtlsdr_set_sample_rate(dev, uint32_t(self->m_nativeRate));
+    long center = long(self->m_cfg.rxFreqHz()) + self->m_nativeOffsetHz;
+    if (center < 0) center = 0;
+    rtlsdr_set_center_freq(dev, uint32_t(center));
+    rtlsdr_set_tuner_gain_mode(dev, 1);   // AGC
+    rtlsdr_reset_buffer(dev);
+
+    std::vector<uint8_t> buf(32768);
+    std::vector<float> f;
+    while (!self->m_nativeStop.load() && self->m_running.load()) {
+        int n = 0;
+        if (rtlsdr_read_sync(dev, buf.data(), int(buf.size()), &n) != 0 || n <= 0) break;
+        int ns = n / 2;
+        f.resize(size_t(ns) * 2);
+        for (int i = 0; i < ns; ++i) {
+            f[2 * i]     = (float(buf[2 * i])     - 127.5f) / 127.5f;
+            f[2 * i + 1] = (float(buf[2 * i + 1]) - 127.5f) / 127.5f;
+        }
+        self->m_rx->process(f.data(), size_t(ns));
+    }
+    rtlsdr_close(dev);
+}
+
+void RxPipeline::nativeSoapyThread(RxPipeline* self)
+{
+    auto diag = [&](const std::string& s) {
+        if (g_rx_logfile) { fprintf(g_rx_logfile, "DIAG %s\n", s.c_str()); fflush(g_rx_logfile); }
+        if (self->m_log) self->m_log(std::string("RX: ") + s);
+    };
+    SoapySDR::Device* dev = static_cast<SoapySDR::Device*>(self->m_externalDevice);
+    bool own = false;
+    if (!dev && !self->m_soapyArgs.empty()) {
+        try { dev = SoapySDR::Device::make(self->m_soapyArgs); own = true; }
+        catch (...) { dev = nullptr; }
+    }
+    if (!dev) {
+        diag("Soapy RX device unavailable");
+        self->m_running.store(false);
+        return;
+    }
+    SoapySDR::Stream* stream = nullptr;
+    try {
+        dev->setSampleRate(SOAPY_SDR_RX, 0, double(self->m_nativeRate));
+        long center = long(self->m_cfg.rxFreqHz()) + self->m_nativeOffsetHz;
+        dev->setFrequency(SOAPY_SDR_RX, 0, double(center));
+        try { dev->setGainMode(SOAPY_SDR_RX, 0, true); } catch (...) {}
+        stream = dev->setupStream(SOAPY_SDR_RX, "CF32");
+        if (!stream) throw std::runtime_error("setupStream failed");
+        dev->activateStream(stream);
+        diag("Soapy RX active");
+    } catch (const std::exception& e) {
+        diag(std::string("Soapy RX setup failed: ") + e.what());
+        if (stream) dev->closeStream(stream);
+        if (own) SoapySDR::Device::unmake(dev);
+        self->m_running.store(false);
+        return;
+    }
+
+    std::vector<std::complex<float>> buff(16384);
+    std::vector<float> f;
+    double rmsAcc = 0; uint64_t rmsN = 0; int chunks = 0;
+    while (!self->m_nativeStop.load() && self->m_running.load()) {
+        void* bufs[1] = { buff.data() };
+        int flags = 0; long long ts = 0;
+        int n = dev->readStream(stream, bufs, buff.size(), flags, ts, 200000);
+        if (n > 0) {
+            f.resize(size_t(n) * 2);
+            for (int i = 0; i < n; ++i) {
+                f[2 * i]     = buff[i].real();
+                f[2 * i + 1] = buff[i].imag();
+                rmsAcc += double(buff[i].real()) * buff[i].real() +
+                          double(buff[i].imag()) * buff[i].imag();
+                ++rmsN;
+            }
+            self->m_rx->process(f.data(), size_t(n));
+            if (++chunks >= 200 && rmsN) {
+                char b[96];
+                snprintf(b, sizeof(b), "rx rms=%.4f syms=%llu fsw=%llu nid=%llu tsbk=%llu",
+                         std::sqrt(rmsAcc / double(rmsN)),
+                         (unsigned long long)self->m_rx->stats().symbols,
+                         (unsigned long long)self->m_rx->stats().fswHits,
+                         (unsigned long long)self->m_rx->stats().nidOk,
+                         (unsigned long long)self->m_rx->stats().tsbks);
+                diag(b);
+                chunks = 0; rmsAcc = 0; rmsN = 0;
+            }
+        }
+    }
+    dev->deactivateStream(stream);
+    dev->closeStream(stream);
+    if (own) SoapySDR::Device::unmake(dev);
+}
 
 void RxPipeline::onWriteEvent(const dsd_opts*, dsd_state*, uint8_t, uint8_t swrite,
                               char* event_string)
@@ -769,3 +936,4 @@ void RxPipeline::stopStderrCapture() {}
 void RxPipeline::stderrReaderThread(RxPipeline*) {}
 
 #endif // SITESIM_HAVE_DSDNEO
+

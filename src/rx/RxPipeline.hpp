@@ -10,6 +10,7 @@
 // Forward-declare dsd-neo C types to avoid pulling all headers into App.hpp
 struct dsd_opts;
 struct dsd_state;
+namespace p25rx { class P25Receiver; }
 
 /**
  * RxPipeline — wraps the dsd-neo engine for P25P1 site-input reception.
@@ -96,6 +97,21 @@ private:
     void startStderrCapture();
     void stopStderrCapture();
     static void stderrReaderThread(RxPipeline* self);
+
+    // ── Native in-process P25-P1 receiver ──────────────────────────────────
+    // Uses p25rx::P25Receiver fed from librtlsdr (RTL) or a SoapySDR RX stream
+    // (shared Pluto). Replaces the dsd-neo dependency for uplink decoding.
+    bool         m_useNative   = false;
+    int          m_nativeOffsetHz = 180000;   // tune offset to dodge DC spike
+    uint32_t     m_nativeRate  = 1536000;
+    p25rx::P25Receiver* m_rx   = nullptr;
+    std::thread  m_nativeThread;
+    std::atomic<bool> m_nativeStop{false};
+    void startNative();
+    void stopNative();
+    void onNativeTsbk(const uint8_t tsbk[12]);
+    static void nativeRtlThread(RxPipeline* self);
+    static void nativeSoapyThread(RxPipeline* self);
 
 #if defined(_WIN32)
     // ── External decoder (dsd-neo v2.10.0 CLI) ─────────────────────────────

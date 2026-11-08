@@ -93,6 +93,7 @@ target_link_libraries(sitesim PRIVATE
     ${SDL2_LIBRARIES}
     OpenGL::GL
 )
+target_link_libraries(sitesim PRIVATE rtlsdr)
 
 target_link_libraries(uplink_test PRIVATE
     ${SOAPY_LIBRARIES}
@@ -311,4 +312,6 @@ if(SITESIM_BUILD_SUBSCRIBER_TEST)
                        "(set SITESIM_BUILD_SUBSCRIBER_TEST=OFF to silence)")
     endif()
 endif()
+
+
 
