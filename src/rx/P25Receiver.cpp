@@ -37,18 +37,18 @@ P25Receiver::P25Receiver() = default;
 bool P25Receiver::configure(double sampleRateHz, uint16_t nac)
 {
     if (!(sampleRateHz > 0.0)) return false;
-    const double sps = sampleRateHz / p25::kSymbolRate;
+    // Decimate IQ to ~48 kHz (like dsd-neo base_decim) before FM demodulation.
+    m_decim     = std::max(1, int(std::lround(sampleRateHz / 48000.0)));
+    m_demodRate = sampleRateHz / double(m_decim);
+    const double sps = m_demodRate / p25::kSymbolRate;
     if (sps < 2.0) return false;
 
     m_sampleRate = sampleRateHz;
     m_sps        = sps;
     m_spsEst     = sps;
     m_nac        = nac;
-    // P25 C4FM peak deviation is 1800 Hz; the discriminator output for an
-    // outer symbol is 2*pi*1800/fs rad/sample. Normalize so outer ~ +/-3.
-    // This is amplitude(gain)-independent and gives the timing loop and slicer
-    // a stable, meaningful scale.
-    m_fmScale = float(3.0 * sampleRateHz / (2.0 * M_PI * 1800.0));
+    // Normalize the discriminator at the demod rate so outer symbol -> +/-3.
+    m_fmScale = float(3.0 * m_demodRate / (2.0 * M_PI * 1800.0));
     reset();
     return true;
 }
@@ -58,6 +58,9 @@ void P25Receiver::reset()
     m_havePrev = false;
     m_haveSym  = false;
     m_acc      = 0.0;
+    m_decimN   = 0;
+    m_decimI   = 0.0;
+    m_decimQ   = 0.0;
     m_spsEst   = m_sps;
     m_fswWin   = 0;
     m_state    = State::Hunt;
@@ -113,11 +116,17 @@ void P25Receiver::process(const float* iq, size_t n)
 {
     if (!iq || n == 0 || m_sps <= 0.0) return;
 
-    // FM discriminator: instantaneous frequency between consecutive samples.
-    m_fmHist.reserve(m_fmHist.size() + n);
+    // Decimate IQ to the demod rate, then FM-discriminate.
+    m_fmHist.reserve(m_fmHist.size() + n / size_t(std::max(1, m_decim)) + 8);
     for (size_t k = 0; k < n; ++k) {
-        float I = iq[2 * k];
-        float Q = iq[2 * k + 1];
+        m_decimI += iq[2 * k];
+        m_decimQ += iq[2 * k + 1];
+        m_stats.samples++;
+        if (++m_decimN < m_decim) continue;
+        float I = float(m_decimI / double(m_decim));
+        float Q = float(m_decimQ / double(m_decim));
+        m_decimI = 0.0; m_decimQ = 0.0; m_decimN = 0;
+
         float fm = 0.0f;
         if (m_havePrev) {
             float re = I * m_prevI + Q * m_prevQ;   // dot
@@ -125,9 +134,8 @@ void P25Receiver::process(const float* iq, size_t n)
             fm = std::atan2(im, re);
         }
         m_prevI = I; m_prevQ = Q; m_havePrev = true;
-        m_dc += (fm - m_dc) * 0.00002f;   // ~30 ms time constant at 1.5 MS/s
+        m_dc += (fm - m_dc) * 0.0007f;   // ~30 ms time constant at 48 kHz
         m_fmHist.push_back((fm - m_dc) * m_fmScale);
-        m_stats.samples++;
     }
 
     // Symbol timing recovery (Gardner) at fractional samples/symbol.
@@ -145,7 +153,7 @@ void P25Receiver::process(const float* iq, size_t n)
         if (pos + 1.0 >= double(m_fmBase + m_fmHist.size())) break;      // need future sample
         if (midPos >= 0.0 && midPos + 1.0 < double(m_fmBase)) break;
 
-        float cur = integrateDump(pos);
+        float cur = interpAt(pos);
         float mid = interpAt(midPos);
 
         if (m_haveSym) {

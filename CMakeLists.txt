@@ -97,6 +97,7 @@ target_link_libraries(sitesim PRIVATE
 target_link_libraries(uplink_test PRIVATE
     ${SOAPY_LIBRARIES}
 )
+target_link_libraries(uplink_test PRIVATE rtlsdr)
 
 # ── dsd-neo backend link + defines (only when available) ─────────────────────
 if(SITESIM_HAVE_DSDNEO)
@@ -310,3 +311,4 @@ if(SITESIM_BUILD_SUBSCRIBER_TEST)
                        "(set SITESIM_BUILD_SUBSCRIBER_TEST=OFF to silence)")
     endif()
 endif()
+

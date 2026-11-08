@@ -14,6 +14,7 @@
 
 #include <SoapySDR/Device.hpp>
 #include <SoapySDR/Formats.hpp>
+#include <rtl-sdr.h>
 
 #ifdef SITESIM_HAVE_DSDNEO
 #include <dsd-neo/core/input_level.h>
@@ -94,6 +95,8 @@ struct RxSource {
     bool        iqCf32   = false;  // offline reader: file is raw float32 I/Q
     bool        selftest = false;  // modulate known TSBKs -> decode (no RF)
     int         ssInterval = 35;   // OSP status symbol interval (frame dibits)
+    bool        rtlNative = false; // capture via librtlsdr directly (proven path)
+    int         rtlOffsetHz = 0;   // tune offset to dodge RTL DC spike
 };
 
 ParseResult parseArgs(int argc, char** argv, SiteConfig& cfg, RxSource& rx)
@@ -234,6 +237,16 @@ ParseResult parseArgs(int argc, char** argv, SiteConfig& cfg, RxSource& rx)
             const char* value = requireValue("--ss");
             if (!value) return ParseResult::Error;
             rx.ssInterval = std::stoi(value);
+            continue;
+        }
+        if (arg == "--rtl-native") {
+            rx.rtlNative = true;
+            continue;
+        }
+        if (arg == "--rtl-offset") {
+            const char* value = requireValue("--rtl-offset");
+            if (!value) return ParseResult::Error;
+            rx.rtlOffsetHz = std::stoi(value);
             continue;
         }
 
@@ -462,6 +475,73 @@ int runSelfTest()
     return ok ? 0 : 2;
 }
 
+int runNativeRtl(const RxSource& rx, const SiteConfig& cfg)
+{
+    rtlsdr_dev_t* dev = nullptr;
+    if (rtlsdr_open(&dev, 0) < 0) { std::cerr << "rtlsdr_open failed (device busy?)\n"; return 1; }
+    const uint32_t rate = 1536000;
+    rtlsdr_set_sample_rate(dev, rate);
+    long center = long(cfg.rxFreqHz()) + rx.rtlOffsetHz;
+    if (center < 0) center = 0;
+    rtlsdr_set_center_freq(dev, uint32_t(center));
+    const bool agc = rx.rxGainDb < 0.0;
+    rtlsdr_set_tuner_gain_mode(dev, agc ? 1 : 0);
+    if (!agc) rtlsdr_set_tuner_gain(dev, int(rx.rxGainDb * 10.0));
+    rtlsdr_reset_buffer(dev);
+
+    p25rx::P25Receiver recv;
+    recv.configure(double(rate), cfg.nac);
+    recv.setSsInterval(rx.ssInterval);
+    recv.setInvert(rx.invert);
+    uint64_t cnt = 0;
+    recv.setTsbkCallback([&](const std::array<uint8_t, 12>& t) {
+        std::printf("TSBK op=0x%02X raw=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                    t[0] & 0x3F, t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7],
+                    t[8], t[9], t[10], t[11]);
+        std::fflush(stdout);
+        ++cnt;
+    });
+
+    std::cout << "Native librtlsdr RX on " << std::fixed << std::setprecision(4)
+              << (cfg.rxFreqHz() / 1e6) << " MHz (offset " << rx.rtlOffsetHz
+              << " Hz) rate=" << rate << " agc=" << (agc ? 1 : 0) << "\n" << std::flush;
+
+    std::vector<uint8_t> buf(32768);
+    std::vector<float> f;
+    std::ofstream rec;
+    if (!rx.recordPath.empty()) { rec.open(rx.recordPath, std::ios::binary);
+        std::cout << "Recording CF32 to " << rx.recordPath << "\n" << std::flush; }
+    double rmsAcc = 0.0; uint64_t rmsN = 0;
+    const int duration = rx.durationSec > 0 ? rx.durationSec : 20;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(duration);
+    while (!g_stop.load() && std::chrono::steady_clock::now() < deadline) {
+        int n = 0;
+        if (rtlsdr_read_sync(dev, buf.data(), int(buf.size()), &n) != 0 || n <= 0) break;
+        int ns = n / 2;
+        f.resize(size_t(ns) * 2);
+        for (int i = 0; i < ns; ++i) {
+            float I = (float(buf[2 * i])     - 127.5f) / 127.5f;
+            float Q = (float(buf[2 * i + 1]) - 127.5f) / 127.5f;
+            f[2 * i] = I; f[2 * i + 1] = Q;
+            rmsAcc += double(I) * I + double(Q) * Q; ++rmsN;
+        }
+        if (rec) rec.write(reinterpret_cast<const char*>(f.data()),
+                           std::streamsize(f.size() * sizeof(float)));
+        recv.process(f.data(), size_t(ns));
+    }
+    if (rec) rec.close();
+    rtlsdr_close(dev);
+
+    auto& s = recv.stats();
+    if (rmsN) std::cout << "IQ rms=" << std::sqrt(rmsAcc / double(rmsN)) << "\n";
+    std::cout << "samples=" << s.samples << " symbols=" << s.symbols
+              << " fswHits=" << s.fswHits << " nidOk=" << s.nidOk
+              << " framesTried=" << s.framesTried << " crcOk=" << s.crcOk
+              << " tsbks=" << s.tsbks << " minFswDist=" << s.minFswDist
+              << "/" << s.minFswDistInv << "\n";
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -488,6 +568,9 @@ int main(int argc, char** argv)
 
     if (!rxSource.iqPath.empty())
         return runOfflineIq(rxSource);
+
+    if (rxSource.rtlNative)
+        return runNativeRtl(rxSource, cfg);
 
     if (rxSource.native)
         return runNativeLive(rxSource, cfg);

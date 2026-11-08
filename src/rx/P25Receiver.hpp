@@ -66,6 +66,14 @@ private:
     bool   m_havePrev = false;
     float  m_prevI = 0.0f, m_prevQ = 0.0f;
 
+    // IQ decimation to the demod rate (~48 kHz) before the FM discriminator,
+    // matching dsd-neo (base_decim=32). Essential: at 1.5 MS/s the per-sample
+    // phase step is tiny and noise dominates the discriminator.
+    int    m_decim   = 1;
+    int    m_decimN  = 0;
+    double m_decimI  = 0.0, m_decimQ = 0.0;
+    double m_demodRate = 48000.0;
+
     // Timing recovery (Gardner) state
     double m_sps        = 10.0;   // samples per symbol (fs / 4800)
     double m_spsEst     = 10.0;   // tracked symbol period
