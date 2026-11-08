@@ -187,3 +187,7 @@ The emphasis is on:
 - making uplink traffic easy to inspect
 - validating subscriber interactions end-to-end
 - keeping the tooling approachable enough to test without real subscriber hardware
+
+## License
+
+Released under the MIT License. See [LICENSE](LICENSE) for the full text.
