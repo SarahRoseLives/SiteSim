@@ -148,7 +148,13 @@ std::array<uint8_t, 12> BuildIDENUp(uint8_t iden, uint16_t bwUnits, int16_t offs
 std::array<uint8_t, 12> BuildGrpVChGrant(uint8_t opts, uint16_t chanID, uint16_t chanNum,
                                           uint16_t talkgroup, uint32_t source) {
     uint64_t ch = (uint64_t(chanID & 0xF) << 12) | uint64_t(chanNum & 0xFFF);
-    uint64_t args = (uint64_t(opts) << 56) | (ch << 40) |
+    // TIA-102.AABC Group Voice Channel Grant (opcode 0x00):
+    //   octet 2..3 = CHAN, octet 4 = SERVICE OPTIONS, octet 5..6 = GROUP ADDRESS,
+    //   octet 7..9 = SOURCE ADDRESS, octet 10..11 = CRC. The channel MUST be at
+    //   [2..3]; placing options first shifted CHAN to [3..4] and made the radio
+    //   read an invalid identifier (iden 0), so it rejected the grant and kept
+    //   re-requesting the voice channel.
+    uint64_t args = (uint64_t(ch) << 48) | (uint64_t(opts) << 40) |
                     (uint64_t(talkgroup) << 24) | uint64_t(source & 0xFFFFFF);
     return buildTSBK(true, TSBK_GRP_VCH_GRANT, 0x00, args);
 }
