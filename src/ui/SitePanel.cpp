@@ -52,6 +52,7 @@ void SitePanel::saveConfig() {
         j["plutoGainDb"]     = m_cfg.plutoGainDb;
         j["ampEnabled"]      = m_cfg.ampEnabled;
         j["minimalCc"]       = m_cfg.minimalCc;
+        j["rxUseRtlsdr"]     = m_cfg.rxUseRtlsdr;
         j["chanId"]          = m_cfg.chanId;
         j["bwUnits"]         = m_cfg.bwUnits;
         j["chSpacUnits"]     = m_cfg.chSpacUnits;
@@ -97,6 +98,7 @@ void SitePanel::loadConfig() {
         m_cfg.plutoGainDb     = j.value("plutoGainDb",     m_cfg.plutoGainDb);
         m_cfg.ampEnabled      = j.value("ampEnabled",      m_cfg.ampEnabled);
         m_cfg.minimalCc       = j.value("minimalCc",       m_cfg.minimalCc);
+        m_cfg.rxUseRtlsdr     = j.value("rxUseRtlsdr",     m_cfg.rxUseRtlsdr);
         m_cfg.chanId          = j.value("chanId",          m_cfg.chanId);
         m_cfg.bwUnits         = j.value("bwUnits",         m_cfg.bwUnits);
         m_cfg.chSpacUnits     = j.value("chSpacUnits",     m_cfg.chSpacUnits);
@@ -497,6 +499,10 @@ void SitePanel::render() {
     if (ImGui::Checkbox("Minimal CC (IDEN_UP/NET_STS/RFSS_STS/SYNC only)",
                         &m_cfg.minimalCc))
         applyConfig();
+
+    ImGui::Checkbox("Uplink RX on RTL-SDR (free it from SDRTrunk)", &m_cfg.rxUseRtlsdr);
+    if (m_cfg.rxUseRtlsdr)
+        ImGui::TextDisabled("Takes effect on next START TX; stop other RTL apps first.");
 
     ImGui::EndChild();
 

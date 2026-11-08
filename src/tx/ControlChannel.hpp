@@ -48,6 +48,12 @@ struct SiteConfig {
     // used to isolate whether a fabricated broadcast is preventing lock.
     bool     minimalCc     = false;
 
+    // Run the uplink (site-input) receiver on a dedicated RTL-SDR instead of
+    // sharing the Pluto with TX. A Pluto transmitting on the control channel
+    // desenses its own receiver only ~5 MHz away, so the uplink is often
+    // deaf; a separate RTL-SDR hears the radios cleanly.
+    bool     rxUseRtlsdr   = false;
+
     // Derived: rxFreqHz = ccFreqHz + txOffsetMHz * 1e6
     double rxFreqHz() const { return ccFreqHz + txOffsetMHz * 1e6; }
 

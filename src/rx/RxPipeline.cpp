@@ -15,12 +15,18 @@
 #include <dsd-neo/io/rtl_demod_config.h>
 #include <dsd-neo/io/rtl_device.h>
 #include <dsd-neo/runtime/exitflag.h>
+#include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/p25_isp_hooks.h>
 #include <dsd-neo/runtime/p25_optional_hooks.h>
 
 #if defined(_WIN32)
 #include <io.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 // Map POSIX fd calls to their MSVCRT underscore equivalents.
 #define sitesim_pipe(fds)   _pipe((fds), 4096, _O_BINARY)
 #define sitesim_read        _read
@@ -40,6 +46,39 @@
 
 // Global pointer for C-style hook callbacks — RxPipeline is a singleton in practice.
 static RxPipeline* g_rx_pipeline = nullptr;
+
+// Dedicated file for engine diagnostics, opened by fopen (not freopen on the
+// inherited stderr, which a windowed process may not have). dsd-neo's runtime
+// log messages are mirrored here through the log-sink below so they are
+// readable even when the GUI process has no console.
+static FILE* g_rx_logfile = nullptr;
+
+static const char* rx_logfile_path()
+{
+#if defined(_WIN32)
+    return "C:\\Users\\Rose\\AppData\\Local\\Temp\\opencode\\sitesim_rx.log";
+#else
+    return "/tmp/sitesim_rx.log";
+#endif
+}
+
+// dsd-neo log-sink callback: mirrored to the diagnostics file and the UI log.
+static void rx_log_sink_write(dsd_neo_log_level_t /*level*/, const char* message, void* context)
+{
+    if (!message) return;
+    if (g_rx_logfile) {
+        fputs(message, g_rx_logfile);
+        if (message[0] != '\0' && message[strlen(message) - 1] != '\n')
+            fputc('\n', g_rx_logfile);
+        fflush(g_rx_logfile);
+    }
+    auto* self = static_cast<RxPipeline*>(context);
+    if (self) {
+        std::string s(message);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        if (!s.empty()) self->logLine(s);
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -70,6 +109,11 @@ void RxPipeline::useRtlsdrSource()
     m_soapyArgs.clear();
     m_soapyProfile.clear();
     m_soapyRate      = 0;
+#if defined(_WIN32)
+    // Prefer the known-good external decoder for RTL RX. The vendored
+    // in-process dsd-neo (v2.3.0) does not decode P25P1 reliably.
+    m_useExternal = externalDecoderAvailable();
+#endif
 }
 
 void RxPipeline::useSoapySource(const std::string& args, const std::string& profile,
@@ -109,7 +153,22 @@ bool RxPipeline::start()
 {
     if (m_running.load()) return true;
 
+    if (m_log) {
+        char m[192];
+        snprintf(m, sizeof(m), "RX starting: %s @ %.4f MHz (%s)%s",
+                 sourceName().c_str(), m_cfg.rxFreqHz() / 1e6,
+                 m_soapy ? (m_shareDevice ? "shared Soapy" : "SoapySDR") : "RTL-SDR",
+                 m_shareDevice ? " - shares device with TX (may be desensed by TX)" : "");
+        m_log(m);
+    }
+
     // Allocate and initialise dsd-neo state
+#if defined(_WIN32)
+    if (m_useExternal) {
+        startExternalDecoder();
+        return m_running.load();
+    }
+#endif
     m_opts  = new dsd_opts{};
     m_state = new dsd_state{};
     initOpts(m_opts);
@@ -129,9 +188,37 @@ bool RxPipeline::start()
         m_opts->rtl_dev_index       = 0;
     }
     m_opts->rtlsdr_center_freq  = static_cast<uint32_t>(m_cfg.rxFreqHz());
-    m_opts->rtl_gain_value      = 0;     // 0 = AGC (auto-gain)
+    // Use RTL AGC (value 0). The reference decoder synced and decoded cleanly
+    // (NAC 123, valid TSBK) with AGC; a forced fixed gain left the front end
+    // clipping ~40%, which produced corrupt frames (NAC 000 / duid EE). AGC
+    // drives the R820T internal LNA/mixer below the manual minimum and yields
+    // far less clipping in this strong near-field setup.
+    m_opts->rtl_gain_value      = 0;     // 0 => RTL AGC
     m_opts->rtlsdr_ppm_error    = 0;     // no manual PPM correction
-    m_opts->rtl_dsp_bw_khz      = 24;    // 24 kHz -> 5 samples/symbol for P25P1
+    // Run the demod at 48 kHz. The P25P1 decoder derives its symbol rate from
+    // the (post-resampler) output rate and assumes ~48 kHz (SPS 10). At 24 kHz
+    // the output lands at SPS 5 ("atypical SPS") and the decoder never syncs,
+    // which is why the in-process RX produced no decodes. 48 kHz is also what
+    // dsd-neo explicitly recommends for P25 ("try 48kHz").
+    m_opts->rtl_dsp_bw_khz      = 48;
+
+    // Build the full RTL input spec exactly as the working standalone CLI does
+    // ("rtl:dev:freq:gain:ppm:bw:sql:vol"). The engine parses tuning from this
+    // string; a bare "rtl" leaves the numeric tokens absent, so populate them
+    // explicitly to guarantee identical device configuration.
+    if (!m_soapy) {
+        snprintf(m_opts->audio_in_dev, sizeof(m_opts->audio_in_dev),
+                 "rtl:%d:%.4fM:%d:%d:%d:%d:%d",
+                 m_opts->rtl_dev_index, m_cfg.rxFreqHz() / 1e6,
+                 m_opts->rtl_gain_value, m_opts->rtlsdr_ppm_error,
+                 m_opts->rtl_dsp_bw_khz, 0, 2);
+    }
+
+    // Route decoded audio to the null sink (equivalent to the standalone CLI's
+    // "-o null"). Without a draining output sink the output ring can fill and
+    // stall the demod pipeline, which stops Sync/TSBK decoding even though the
+    // RF input is streaming. "null" is recognized as audio_out_type 9.
+    snprintf(m_opts->audio_out_dev, sizeof(m_opts->audio_out_dev), "null");
 
     // Zero-IF Soapy SDRs (Pluto) should tune directly to the signal. dsd-neo's
     // fs/4 fallback moves the LO 384 kHz off-center, which the narrow Soapy RF
@@ -176,6 +263,19 @@ bool RxPipeline::start()
     exitflag = 0;
     startStderrCapture();
 
+    // Open our own diagnostics file and install a dsd-neo log sink so engine
+    // messages are captured regardless of stdio validity in a GUI process.
+    if (!g_rx_logfile) {
+        g_rx_logfile = fopen(rx_logfile_path(), "w");
+    }
+    {
+        dsd_neo_log_sink sink{};
+        sink.write         = &rx_log_sink_write;
+        sink.context       = this;
+        sink.mirror_stderr = 0;
+        dsd_neo_log_sink_set(&sink);
+    }
+
     char startMsg[128];
     snprintf(startMsg, sizeof(startMsg), "RX started — %s @ %.4f MHz (P25P1 ISP mode)",
              sourceName().c_str(), m_cfg.rxFreqHz() / 1e6);
@@ -187,6 +287,13 @@ bool RxPipeline::start()
 
 void RxPipeline::stop()
 {
+#if defined(_WIN32)
+    if (m_useExternal) {
+        stopExternalDecoder();
+        m_running.store(false);
+        return;
+    }
+#endif
     m_running.store(false);
     if (m_thread.joinable()) {
         exitflag = 1;      // signals dsd_engine_run() to exit its loop
@@ -196,7 +303,15 @@ void RxPipeline::stop()
     // RX is done with the borrowed device; the transmitter still owns it.
     rtl_device_set_external_soapy_device(nullptr);
 
+    dsd_neo_log_sink_reset();
+
     stopStderrCapture();
+
+    if (g_rx_logfile) {
+        fflush(g_rx_logfile);
+        fclose(g_rx_logfile);
+        g_rx_logfile = nullptr;
+    }
 
     if (m_opts) {
         // Clear hooks before freeing so dangling calls cannot fire.
@@ -212,7 +327,11 @@ void RxPipeline::stop()
 
 void RxPipeline::engineThread(RxPipeline* self)
 {
+    if (self->m_log)
+        self->m_log("RX engine thread started - opening RTL...");
     dsd_engine_run(self->m_opts, self->m_state);
+    if (self->m_log)
+        self->m_log("RX engine stopped - device open failed or stream ended (is the RTL held by another app like SDRTrunk?)");
     self->m_running.store(false);
 }
 
@@ -320,20 +439,21 @@ void RxPipeline::onWriteEvent(const dsd_opts*, dsd_state*, uint8_t, uint8_t swri
 
 void RxPipeline::startStderrCapture()
 {
-    int fds[2];
-    if (sitesim_pipe(fds) != 0) return;
-
-    m_pipeRead  = fds[0];
-    m_pipeWrite = fds[1];
-
-    // Save original stderr and redirect it to the pipe write end. The reader
-    // thread does a blocking read; closing the write end in stopStderrCapture()
-    // yields EOF and unblocks it (no non-blocking polling needed).
-    m_stderrSavedFd = sitesim_dup(STDERR_FILENO);
-    sitesim_dup2(m_pipeWrite, STDERR_FILENO);
+    // Discard dsd-neo's console output to the null device. A pipe drained by a
+    // reader thread can stall the in-process engine (verbose output fills the
+    // 4 KB pipe faster than the reader drains it, blocking the engine on stderr
+    // writes and stopping all decoding). Decoded ISP events still reach the RX
+    // log through the p25_isp / optional hooks.
     fflush(stderr);
-
-    m_stderrThread = std::thread(&RxPipeline::stderrReaderThread, this);
+    // freopen is reliable even when a GUI process starts with an invalid
+    // stderr handle (dup2 onto fd 2 can silently fail there, losing all output).
+    // NOTE: this targets a separate file from the log-sink diagnostics file so
+    // the two writers never share a path/offset.
+#if defined(_WIN32)
+    (void)::freopen("C:\\Users\\Rose\\AppData\\Local\\Temp\\opencode\\sitesim_stderr.log", "w", stderr);
+#else
+    (void)::freopen("/tmp/sitesim_stderr.log", "w", stderr);
+#endif
 }
 
 void RxPipeline::stopStderrCapture()
@@ -377,6 +497,177 @@ void RxPipeline::stderrReaderThread(RxPipeline* self)
     if (!line.empty() && self->m_log)
         self->m_log(line);
 }
+
+#if defined(_WIN32)
+// ── External decoder bridge (dsd-neo v2.10.0) ─────────────────────────────────
+
+static const char* kExtDecoderExe =
+    "C:\\Users\\Rose\\Documents\\dsd-neo-msvc-x86_64-native-v2.10.0\\bin\\dsd-neo.exe";
+static const char* kExtDecoderDir =
+    "C:\\Users\\Rose\\Documents\\dsd-neo-msvc-x86_64-native-v2.10.0\\bin";
+
+bool RxPipeline::externalDecoderAvailable()
+{
+    return GetFileAttributesA(kExtDecoderExe) != INVALID_FILE_ATTRIBUTES;
+}
+
+void RxPipeline::startExternalDecoder()
+{
+    if (m_running.load()) return;
+
+    if (!g_rx_logfile)
+        g_rx_logfile = fopen(rx_logfile_path(), "w");
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "\"%s\" -i rtl:0:%.4fM:0:0:48:0:2 -o null --frontend none -Z",
+             kExtDecoderExe, m_cfg.rxFreqHz() / 1e6);
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength        = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) {
+        if (m_log) m_log("RX: failed to create pipe for external decoder");
+        return;
+    }
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si{};
+    si.cb          = sizeof(si);
+    si.dwFlags     = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdInput   = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput  = wr;
+    si.hStdError   = wr;
+
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessA(nullptr, cmd, nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+                        nullptr, kExtDecoderDir, &si, &pi)) {
+        CloseHandle(rd);
+        CloseHandle(wr);
+        if (m_log) m_log("RX: failed to start external dsd-neo decoder");
+        return;
+    }
+    CloseHandle(wr);  // parent keeps only the read end
+
+    m_hProc   = (void*)pi.hProcess;
+    m_hThread = (void*)pi.hThread;
+    m_hRead   = (void*)rd;
+    m_lineBuf.clear();
+    m_expectPdu = false;
+    m_readerRunning.store(true);
+    m_running.store(true);
+
+    if (m_log) {
+        char m[256];
+        snprintf(m, sizeof(m), "RX started (external dsd-neo v2.10.0) @ %.4f MHz",
+                 m_cfg.rxFreqHz() / 1e6);
+        m_log(m);
+    }
+    m_reader = std::thread(decoderReaderThread, this);
+}
+
+void RxPipeline::stopExternalDecoder()
+{
+    m_readerRunning.store(false);
+    if (m_hProc)
+        TerminateProcess((HANDLE)m_hProc, 0);
+    if (m_reader.joinable())
+        m_reader.join();
+    if (m_hRead)   { CloseHandle((HANDLE)m_hRead);   m_hRead = nullptr; }
+    if (m_hThread) { CloseHandle((HANDLE)m_hThread); m_hThread = nullptr; }
+    if (m_hProc)   { CloseHandle((HANDLE)m_hProc);   m_hProc = nullptr; }
+    m_lineBuf.clear();
+    m_expectPdu = false;
+    if (g_rx_logfile) { fflush(g_rx_logfile); fclose(g_rx_logfile); g_rx_logfile = nullptr; }
+    m_running.store(false);
+}
+
+void RxPipeline::decoderReaderThread(RxPipeline* self)
+{
+    char buf[1024];
+    while (self->m_readerRunning.load()) {
+        DWORD n = 0;
+        if (!ReadFile((HANDLE)self->m_hRead, buf, sizeof(buf), &n, nullptr) || n == 0)
+            break;
+        self->feedDecoderBytes(buf, (int)n);
+    }
+}
+
+void RxPipeline::feedDecoderBytes(const char* data, int n)
+{
+    auto hexv = [](char h) -> int {
+        if (h >= '0' && h <= '9') return h - '0';
+        if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+        if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+        return -1;
+    };
+
+    for (int i = 0; i < n; ++i) {
+        char c = data[i];
+        if (c == '\r') continue;
+        if (c != '\n') {
+            if (m_lineBuf.size() < 8192) m_lineBuf.push_back(c);
+            continue;
+        }
+
+        // Complete line: strip ANSI SGR sequences (ESC ... 'm').
+        std::string clean;
+        clean.reserve(m_lineBuf.size());
+        for (size_t j = 0; j < m_lineBuf.size(); ++j) {
+            if (m_lineBuf[j] == 0x1b) {
+                ++j;
+                while (j < m_lineBuf.size() && m_lineBuf[j] != 'm') ++j;
+                continue;
+            }
+            clean.push_back(m_lineBuf[j]);
+        }
+        m_lineBuf.clear();
+
+        if (clean.find("PDU Payload") != std::string::npos) {
+            m_expectPdu = true;
+            continue;
+        }
+        if (!m_expectPdu) continue;
+
+        uint8_t bytes[64];
+        int cnt = 0;
+        for (size_t j = 0; j + 3 < clean.size() && cnt < 64;) {
+            if (clean[j] == '[' && clean[j + 3] == ']') {
+                int a = hexv(clean[j + 1]);
+                int b = hexv(clean[j + 2]);
+                if (a >= 0 && b >= 0) {
+                    bytes[cnt++] = (uint8_t)((a << 4) | b);
+                    j += 4;
+                    continue;
+                }
+            }
+            ++j;
+        }
+        if (cnt >= 12) {
+            uint8_t raw12[12];
+            memcpy(raw12, bytes, sizeof(raw12));
+            m_expectPdu = false;
+            emitDecodedTsbk(raw12);
+        }
+        // else: not enough bytes yet (e.g. continuation line) - keep waiting
+    }
+}
+
+void RxPipeline::emitDecodedTsbk(const uint8_t raw12[12])
+{
+    uint8_t opcode = raw12[1] & 0x3F;
+    if (g_rx_logfile) {
+        fprintf(g_rx_logfile,
+                "TSBK opcode=0x%02X raw=[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]\n",
+                opcode, raw12[0], raw12[1], raw12[2], raw12[3], raw12[4], raw12[5],
+                raw12[6], raw12[7], raw12[8], raw12[9], raw12[10], raw12[11]);
+        fflush(g_rx_logfile);
+    }
+    handleIspTsbk(opcode, raw12);
+}
+#endif // _WIN32
 
 #else // !SITESIM_HAVE_DSDNEO
 // ─────────────────────────────────────────────────────────────────────────────

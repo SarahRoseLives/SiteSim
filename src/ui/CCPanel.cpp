@@ -99,7 +99,19 @@ void CCPanel::render(const SiteConfig& cfg) {
                 // the LO would stay where it was and transmit somewhere
                 // unintended.
                 if (!m_tx.isOpen() || m_tx.frequencyValid()) {
-                    if (m_tx.isPluto()) {
+                    // A dedicated RTL-SDR decodes the uplink reliably; the
+                    // Pluto's own full-duplex RX does not deliver decodable
+                    // samples in practice, so allow running RX on the RTL.
+                    const bool sharedPluto = m_tx.isPluto() && !plan.rxUseRtlsdr;
+                    if (sharedPluto) {
+                        m_rx.useSharedSoapyDevice(
+                            m_tx.device(), m_tx.argsString(), "pluto",
+                            static_cast<uint32_t>(m_tx.sampleRate() > 0.0 ? m_tx.sampleRate()
+                                                                           : 1536000.0));
+                    } else {
+                        m_rx.useRtlsdrSource();
+                    }
+                    if (sharedPluto) {
                         // Full duplex on one radio: bring RX up first so
                         // dsd-neo can share the already-open device, then start
                         // the TX stream.

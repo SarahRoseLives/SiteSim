@@ -37,8 +37,8 @@ std::vector<uint8_t> insertStatusSymbols(const std::vector<uint8_t>& data, uint8
 
     // Slotted ALOHA: the first status symbol of the OSP announces the start of
     // the inbound slot (0b11 = idle); the remaining microslots are
-    // "between slot boundaries" (0b10). Emitting a constant value never gives
-    // a subscriber a usable inbound slot and it will not transmit.
+    // "between slot boundaries" (0b10). This exact pattern is required for a
+    // Motorola to lock the control channel — an all-idle pattern breaks lock.
     int remaining = numSS;
     int ssIndex   = 0;
     auto nextStatus = [&]() -> uint8_t {

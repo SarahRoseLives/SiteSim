@@ -39,6 +39,11 @@ public:
     bool isRunning() const { return m_running.load(); }
     void setLogCallback(LogCallback log) { m_log = std::move(log); }
 
+    // Forward an already-formatted line to the UI log (used by the dsd-neo
+    // runtime log sink so engine messages reach the operator regardless of
+    // whether this GUI process has a valid stdio stderr handle).
+    void logLine(const std::string& s) { if (m_log) m_log(s); }
+
     // ── RX source selection ────────────────────────────────────────────────
     // Default is the native librtlsdr path (HackRF TX + RTL-SDR RX setup).
     void useRtlsdrSource();
@@ -91,4 +96,26 @@ private:
     void startStderrCapture();
     void stopStderrCapture();
     static void stderrReaderThread(RxPipeline* self);
+
+#if defined(_WIN32)
+    // ── External decoder (dsd-neo v2.10.0 CLI) ─────────────────────────────
+    // The vendored in-process dsd-neo (v2.3.0) mis-demodulates P25P1, so for
+    // the RTL-SDR path SiteSim runs the known-good standalone decoder as a
+    // child process and bridges its decoded TSBKs back into this pipeline.
+    bool        m_useExternal = false;
+    void*       m_hProc       = nullptr;   // HANDLE hProcess
+    void*       m_hThread     = nullptr;   // HANDLE hThread
+    void*       m_hRead       = nullptr;   // HANDLE stderr read end
+    std::thread m_reader;
+    std::atomic<bool> m_readerRunning{false};
+    std::string m_lineBuf;
+    bool        m_expectPdu = false;
+
+    static bool externalDecoderAvailable();
+    void  startExternalDecoder();
+    void  stopExternalDecoder();
+    static void decoderReaderThread(RxPipeline* self);
+    void  feedDecoderBytes(const char* data, int n);
+    void  emitDecodedTsbk(const uint8_t raw12[12]);
+#endif
 };
