@@ -376,7 +376,7 @@ void RxPipeline::handleIspTsbk(uint8_t opcode, const uint8_t raw12[12])
         bool emrg = (options >> 7) & 1;
         auto grant = p25::BuildGrpVChGrant(
             emrg ? 0x80 : 0x00,
-            m_cfg.chanId,
+            m_cfg.voiceChanId,
             m_cfg.vChanNum,
             static_cast<uint16_t>(tgid),
             src_id);
@@ -390,8 +390,8 @@ void RxPipeline::handleIspTsbk(uint8_t opcode, const uint8_t raw12[12])
         snprintf(buf, sizeof(buf),
                  "GRP_VCH_REQ  SRC:%-8u TGID:%-5u%s -> granted VC %.5f MHz (IDEN %u ch %u)",
                  src_id, tgid, emrg ? " [EMRG]" : "",
-                 m_cfg.channelFrequency(m_cfg.vChanNum) / 1e6,
-                 unsigned(m_cfg.chanId), unsigned(m_cfg.vChanNum));
+                 m_cfg.voiceChannelFrequency(m_cfg.vChanNum) / 1e6,
+                 unsigned(m_cfg.voiceChanId), unsigned(m_cfg.vChanNum));
         m_log(buf);
         break;
     }

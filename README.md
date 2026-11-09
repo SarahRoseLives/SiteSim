@@ -110,13 +110,23 @@ channel it should grant:
   `uplink − control channel`; editing the control channel preserves that
   offset, and editing the uplink changes it.
 
-The `IDEN_UP` band plan is derived automatically from the lowest frequency in
-the plan and the selected spacing (6.25/12.5/25 kHz). The UI shows the resolved
-channel numbers and refuses to apply/start if a channel is outside the amateur
-bands or does not fit in the 4095-step IDEN range. Defaults are SYSID `0x123`,
-a 12.5 kHz 70cm plan (control `438.8000`, voice `438.8125`, `438.8250`,
-`438.8375` MHz), and a −5 MHz uplink split (`433.8000` MHz). Edit the uplink
-field for your repeater's actual input; the offset sent in `IDEN_UP` follows.
+The control channel and the voice channels are advertised with **separate
+`IDEN_UP` band plans**. The control IDEN is based on the control frequency
+(CC = channel 0); the voice IDEN is based one spacing below the lowest voice
+channel, so the first VC is channel 1 regardless of how far the VCs sit from
+the CC. That keeps voice channel numbers small even when the channels are
+spread, which some subscribers require before they accept a grant and give a
+talk permit. The UI shows both resolved channel numbers and refuses to
+apply/start if a channel (or its uplink) is outside the amateur bands or the
+voice plan does not fit in the 4095-step IDEN range.
+
+Defaults are SYSID `0x123`, a 12.5 kHz 70cm plan (control `438.8000`, voice
+`438.3000`, `438.3125`, `438.3250` MHz), and a −5 MHz uplink split
+(control uplink `433.8000` MHz). The VCs sit below the CC on purpose: the site
+receiver is tuned ~180 kHz above the control uplink to dodge its DC spike, so
+voice uplinks below the CC fall outside that RX passband and do not desense it.
+Edit the uplink field for your repeater's actual input; the offset sent in
+`IDEN_UP` follows.
 
 ## 5. Radio backends
 

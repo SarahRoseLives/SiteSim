@@ -79,10 +79,19 @@ static void sendFrame(SoapyTx& tx, p25::C4FM& c4fm, const std::vector<uint8_t>& 
 
 void ControlChannel::producerThread() {
     // Build system TSBKs from current config.
-    // IDEN_UP uses the channel plan from SiteConfig so radios can resolve
-    // voice channel numbers to actual frequencies.
-    auto idenUp  = p25::BuildIDENUp(
+    // Two IDEN_UP broadcasts: one for the control channel (base = CC frequency,
+    // CC = channel 0) and one for the voice channels (base just below the
+    // lowest VC). That keeps voice channel numbers small even when the VCs are
+    // spread far from the CC.
+    auto ccIdenUp = p25::BuildIDENUp(
         m_cfg.chanId,
+        m_cfg.bwUnits,
+        m_cfg.txOffsetUnits,
+        m_cfg.chSpacUnits,
+        uint64_t(m_cfg.ccBaseFreqHz)
+    );
+    auto voiceIdenUp = p25::BuildIDENUp(
+        m_cfg.voiceChanId,
         m_cfg.bwUnits,
         m_cfg.txOffsetUnits,
         m_cfg.chSpacUnits,
@@ -107,10 +116,11 @@ void ControlChannel::producerThread() {
     auto motoTcId = p25::BuildMotoTrafficChannelId(0x4000C00000000800ull);
 
     // Secondary control channel broadcast: advertise the voice channel as the
-    // backup control channel (as a real ASTRO 25 site does).
+    // backup control channel (as a real ASTRO 25 site does). The voice channel
+    // is on the voice IDEN.
     auto secCc = p25::BuildSecCcBcast(m_cfg.rfssid, m_cfg.siteid,
-                                      m_cfg.chanId, m_cfg.vChanNum, 0x04,
-                                      m_cfg.chanId, m_cfg.vChanNum, 0x04);
+                                      m_cfg.voiceChanId, m_cfg.vChanNum, 0x04,
+                                      m_cfg.voiceChanId, m_cfg.vChanNum, 0x04);
 
     struct SysMsg {
         std::array<uint8_t, 12> tsbk;
@@ -118,7 +128,8 @@ void ControlChannel::producerThread() {
         bool                    liveSync;  // rebuilt each pass (timestamp)
     };
     std::vector<SysMsg> rotation;
-    rotation.push_back({ idenUp,  "IDEN_UP",  false });
+    rotation.push_back({ ccIdenUp,    "IDEN_UP_CC", false });
+    rotation.push_back({ voiceIdenUp, "IDEN_UP_VC", false });
     rotation.push_back({ netSts,  "NET_STS",  false });
     rotation.push_back({ rfssSts, "RFSS_STS", false });
     if (!m_cfg.minimalCc) {
@@ -130,11 +141,13 @@ void ControlChannel::producerThread() {
     rotation.push_back({ {}, "SYNC", true });
 
     {
-        char planMsg[192];
+        char planMsg[224];
         snprintf(planMsg, sizeof(planMsg),
-                 "PLAN CC %.5f MHz (IDEN %u ch %u)  VC %.5f MHz (IDEN %u ch %u)",
-                 m_cfg.ccFreqHz / 1e6, unsigned(m_cfg.chanId), unsigned(m_cfg.ccChanNum),
-                 m_cfg.voiceFreqHz() / 1e6, unsigned(m_cfg.chanId), unsigned(m_cfg.vChanNum));
+                 "PLAN CC %.5f MHz (IDEN %u base %.5f ch %u)  VC %.5f MHz (IDEN %u base %.5f ch %u)",
+                 m_cfg.ccFreqHz / 1e6, unsigned(m_cfg.chanId), m_cfg.ccBaseFreqHz / 1e6,
+                 unsigned(m_cfg.ccChanNum),
+                 m_cfg.voiceFreqHz() / 1e6, unsigned(m_cfg.voiceChanId),
+                 m_cfg.vchanBaseFreqHz / 1e6, unsigned(m_cfg.vChanNum));
         addLog(planMsg);
     }
 
@@ -142,8 +155,14 @@ void ControlChannel::producerThread() {
     uint64_t frameN = 0;
 
     while (m_running.load()) {
-        // Back off if ring is over half full
-        while (m_tx.ringAvailable() > SoapyTx::kRingSize / 2) {
+        // Back off once the ring holds more than ~85 ms of audio. Keeping this
+        // low matters for queued responses (voice channel grants): the producer
+        // generates frames ahead of the transmitter, and a large backlog delays
+        // a grant by however much audio is buffered. At the Pluto's 1.536 MS/s a
+        // half-full 4 MB ring was ~0.65 s (vs ~0.43 s on a 2.4 MS/s HackRF),
+        // which is enough for a subscriber to miss its talk-permit window and
+        // repeat the request. 256 kB keeps it well under 100 ms.
+        while (m_tx.ringAvailable() > SoapyTx::kRingSize / 16) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             if (!m_running.load()) return;
         }

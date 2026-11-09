@@ -63,30 +63,43 @@ struct SiteConfig {
 
     // ── Channel plan ──────────────────────────────────────────────────────
     // The user edits this list and picks one channel for the control channel
-    // and one for voice.  A single IDEN_UP band plan is derived from the
-    // lowest frequency in the list, so every channel must fit in 4095 steps.
+    // and one for voice.  The control channel and the voice channels use
+    // separate IDEN_UP band plans: the CC IDEN base sits on the control
+    // frequency (CC = channel 0) and the voice IDEN base sits just below the
+    // lowest voice channel (first VC = channel 1). This lets the VCs be spread
+    // far from the CC for uplink-desense reasons while their channel numbers
+    // stay small, which some subscribers require before they accept a grant.
+    //
+    // The defaults deliberately put the VCs below the CC: the site receiver is
+    // tuned ~180 kHz above the CC uplink to dodge its DC spike, so voice
+    // uplinks placed below the CC fall outside that RX passband.
     std::vector<Channel> channels = {
         { "CC 1", 438.8000e6 },
-        { "VC 1", 438.8125e6 },
-        { "VC 2", 438.8250e6 },
-        { "VC 3", 438.8375e6 },
+        { "VC 1", 438.3000e6 },
+        { "VC 2", 438.3125e6 },
+        { "VC 3", 438.3250e6 },
     };
     int controlIndex = 0;
     int voiceIndex   = 1;
 
-    // IDEN_UP band plan (derived; see normalizeChannelPlan()).
+    // IDEN_UP band plans (derived; see normalizeChannelPlan()).
+    // chanId is the control-channel IDEN; voiceChanId is a second IDEN that
+    // carries the voice channels, so they can be spread far from the CC with
+    // small channel numbers.
     uint8_t  chanId          = 1;
+    uint8_t  voiceChanId     = 2;
     uint16_t bwUnits         = 100;   // 100 = 12.5 kHz narrowband
     uint16_t chSpacUnits     = 100;   // 100 = 12.5 kHz (125 Hz units)
-    double   vchanBaseFreqHz = 438.8000e6;
-    uint16_t vChanNum        = 1;     // selected voice channel number
-    uint16_t ccChanNum       = 0;     // selected control channel number
+    double   ccBaseFreqHz    = 438.8000e6;  // CC IDEN base (CC = channel 0)
+    double   vchanBaseFreqHz = 438.2875e6;  // voice IDEN base (first VC = channel 1)
+    uint16_t vChanNum        = 1;     // selected voice channel number (voice IDEN)
+    uint16_t ccChanNum       = 0;     // selected control channel number (CC IDEN)
 
     double spacingHz() const {
         return double(chSpacUnits ? chSpacUnits : 100) * 125.0;
     }
 
-    // Raw (possibly out-of-range) channel number for a frequency.
+    // Raw (possibly out-of-range) channel number in the voice IDEN.
     long long channelNumberRaw(double freqHz) const {
         return llround((freqHz - vchanBaseFreqHz) / spacingHz());
     }
@@ -99,9 +112,15 @@ struct SiteConfig {
         return uint16_t(n);
     }
 
-    // Frequency the IDEN_UP maps a channel number to.
+    // Frequency the voice IDEN_UP maps a channel number to.
     double channelFrequency(uint16_t num) const {
         return vchanBaseFreqHz + double(num) * spacingHz();
+    }
+    double voiceChannelFrequency(uint16_t num) const { return channelFrequency(num); }
+
+    // Frequency the control IDEN_UP maps a channel number to.
+    double ccChannelFrequency(uint16_t num) const {
+        return ccBaseFreqHz + double(num) * spacingHz();
     }
 
     double controlFreqHz() const {
@@ -116,8 +135,9 @@ struct SiteConfig {
         return channelFrequency(vChanNum);
     }
 
-    // Recompute the band plan and selected channel numbers. Returns false when
-    // the plan cannot be represented by one IDEN_UP (span > 4095 steps).
+    // Recompute the two band plans and selected channel numbers. Returns false
+    // when the voice channels cannot be represented by one voice IDEN_UP
+    // (span > 4095 steps).
     bool normalizeChannelPlan() {
         if (channels.empty()) {
             Channel c{};
@@ -132,22 +152,41 @@ struct SiteConfig {
         if (voiceIndex < 0 || voiceIndex >= int(channels.size()))
             voiceIndex = channels.size() > 1 ? 1 : 0;
 
-        double minF = channels[0].freqHz;
-        for (const auto& c : channels)
-            if (c.freqHz < minF) minF = c.freqHz;
+        chanId      &= 0x0F;
+        voiceChanId &= 0x0F;
+        if (voiceChanId == chanId)
+            voiceChanId = uint8_t((chanId + 1) & 0x0F);
 
-        vchanBaseFreqHz = minF;
-        ccFreqHz        = channels[size_t(controlIndex)].freqHz;
+        const double spacing = spacingHz();
+
+        // Control IDEN: base on the control frequency, so the CC is channel 0.
+        ccFreqHz     = channels[size_t(controlIndex)].freqHz;
+        ccBaseFreqHz = ccFreqHz;
+        ccChanNum    = 0;
+
+        // Voice IDEN: cover every channel except the selected control channel,
+        // with the base one spacing below the lowest so the first VC is channel
+        // 1 (the old, known-good grant numbering).
+        double minV = 0.0;
+        bool haveV = false;
+        for (size_t i = 0; i < channels.size(); ++i) {
+            if (int(i) == controlIndex) continue;
+            if (!haveV || channels[i].freqHz < minV) {
+                minV = channels[i].freqHz;
+                haveV = true;
+            }
+        }
+        if (!haveV) minV = ccFreqHz;
+        vchanBaseFreqHz = minV - spacing;
+        if (vchanBaseFreqHz < 0.0) vchanBaseFreqHz = 0.0;
 
         bool ok = true;
-        const double spacing = spacingHz();
-        for (const auto& c : channels) {
-            long long n = llround((c.freqHz - minF) / spacing);
+        for (size_t i = 0; i < channels.size(); ++i) {
+            if (int(i) == controlIndex) continue;
+            long long n = llround((channels[i].freqHz - vchanBaseFreqHz) / spacing);
             if (n < 0 || n > 4095) ok = false;
         }
-
-        ccChanNum = channelNumberFor(ccFreqHz);
-        vChanNum  = channelNumberFor(channels[size_t(voiceIndex)].freqHz);
+        vChanNum = channelNumberFor(channels[size_t(voiceIndex)].freqHz);
         return ok;
     }
 
@@ -168,28 +207,36 @@ struct SiteConfig {
         if (spacingHz() <= 0.0)
             return fail("Invalid channel spacing.");
 
-        double minF = channels[0].freqHz;
-        for (const auto& c : channels)
-            if (c.freqHz < minF) minF = c.freqHz;
+        auto inBand = [](double f) {
+            return (f >= 144.0e6 && f <= 148.0e6) ||
+                   (f >= 420.0e6 && f <= 450.0e6);
+        };
 
         const double spacing = spacingHz();
-        for (const auto& c : channels) {
-            bool in2m = (c.freqHz >= 144.0e6 && c.freqHz <= 148.0e6);
-            bool in70 = (c.freqHz >= 420.0e6 && c.freqHz <= 450.0e6);
-            if (!in2m && !in70)
+        double minV = 0.0, maxV = 0.0;
+        bool haveV = false;
+        for (size_t i = 0; i < channels.size(); ++i) {
+            const auto& c = channels[i];
+            if (!inBand(c.freqHz))
                 return fail(std::string("Channel \"") + c.name +
                             "\" is outside the 2m/70cm amateur bands.");
-            long long n = llround((c.freqHz - minF) / spacing);
-            if (n < 0 || n > 4095)
-                return fail("Channel plan spans more than 4095 x spacing; "
-                            "use fewer/adjacent channels or wider spacing.");
+            if (int(i) == controlIndex) continue;
+            if (!haveV || c.freqHz < minV) minV = c.freqHz;
+            if (!haveV || c.freqHz > maxV) maxV = c.freqHz;
+            haveV = true;
         }
+        if (haveV && llround((maxV - minV) / spacing) > 4095)
+            return fail("Voice channels span more than 4095 x spacing; "
+                        "use fewer/adjacent voice channels or wider spacing.");
 
-        double uplink = rxFreqHz();
-        bool up2m = (uplink >= 144.0e6 && uplink <= 148.0e6);
-        bool up70 = (uplink >= 420.0e6 && uplink <= 450.0e6);
-        if (!up2m && !up70)
+        if (!inBand(rxFreqHz()))
             return fail("Uplink / site input is outside the 2m/70cm amateur bands.");
+        for (size_t i = 0; i < channels.size(); ++i) {
+            if (int(i) == controlIndex) continue;
+            if (!inBand(channels[i].freqHz + txOffsetMHz * 1e6))
+                return fail(std::string("Voice uplink for \"") + channels[i].name +
+                            "\" is outside the 2m/70cm amateur bands.");
+        }
 
         long long offUnits = llround(txOffsetMHz * 4.0);  // 250 kHz units
         if (offUnits < -255 || offUnits > 255)
@@ -200,14 +247,15 @@ struct SiteConfig {
     void resetDefaultChannelPlan() {
         channels = {
             { "CC 1", 438.8000e6 },
-            { "VC 1", 438.8125e6 },
-            { "VC 2", 438.8250e6 },
-            { "VC 3", 438.8375e6 },
+            { "VC 1", 438.3000e6 },
+            { "VC 2", 438.3125e6 },
+            { "VC 3", 438.3250e6 },
         };
         controlIndex = 0;
         voiceIndex   = 1;
         chSpacUnits  = 100;
         chanId       = 1;
+        voiceChanId  = 2;
         normalizeChannelPlan();
     }
 };

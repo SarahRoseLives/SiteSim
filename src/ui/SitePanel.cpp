@@ -54,6 +54,7 @@ void SitePanel::saveConfig() {
         j["minimalCc"]       = m_cfg.minimalCc;
         j["rxUseRtlsdr"]     = m_cfg.rxUseRtlsdr;
         j["chanId"]          = m_cfg.chanId;
+        j["voiceChanId"]     = m_cfg.voiceChanId;
         j["bwUnits"]         = m_cfg.bwUnits;
         j["chSpacUnits"]     = m_cfg.chSpacUnits;
         j["controlIndex"]    = m_cfg.controlIndex;
@@ -65,6 +66,7 @@ void SitePanel::saveConfig() {
 
         // Keep the derived values for older builds/tools that read them.
         j["ccFreqHz"]        = m_cfg.ccFreqHz;
+        j["ccBaseFreqHz"]    = m_cfg.ccBaseFreqHz;
         j["vchanBaseFreqHz"] = m_cfg.vchanBaseFreqHz;
         j["vChanNum"]        = m_cfg.vChanNum;
 
@@ -100,6 +102,7 @@ void SitePanel::loadConfig() {
         m_cfg.minimalCc       = j.value("minimalCc",       m_cfg.minimalCc);
         m_cfg.rxUseRtlsdr     = j.value("rxUseRtlsdr",     m_cfg.rxUseRtlsdr);
         m_cfg.chanId          = j.value("chanId",          m_cfg.chanId);
+        m_cfg.voiceChanId     = j.value("voiceChanId",     m_cfg.voiceChanId);
         m_cfg.bwUnits         = j.value("bwUnits",         m_cfg.bwUnits);
         m_cfg.chSpacUnits     = j.value("chSpacUnits",     m_cfg.chSpacUnits);
 
@@ -298,9 +301,10 @@ void SitePanel::renderChannelPlan() {
                 unsigned(m_cfg.chanId), unsigned(m_cfg.ccChanNum));
     ImGui::Text("VC: %.5f MHz  (IDEN %u, ch %u -> %.5f MHz)",
                 m_cfg.voiceFreqHz() / 1e6,
-                unsigned(m_cfg.chanId), unsigned(m_cfg.vChanNum),
-                m_cfg.channelFrequency(m_cfg.vChanNum) / 1e6);
-    ImGui::TextDisabled("IDEN base %.5f MHz, %.2f kHz spacing",
+                unsigned(m_cfg.voiceChanId), unsigned(m_cfg.vChanNum),
+                m_cfg.voiceChannelFrequency(m_cfg.vChanNum) / 1e6);
+    ImGui::TextDisabled("CC IDEN base %.5f MHz; VC IDEN base %.5f MHz, %.2f kHz spacing",
+                        m_cfg.ccBaseFreqHz / 1e6,
                         m_cfg.vchanBaseFreqHz / 1e6,
                         m_cfg.spacingHz() / 1e3);
 
@@ -310,10 +314,13 @@ void SitePanel::renderChannelPlan() {
         ImGui::PopStyleColor();
     } else {
         bool offGrid = false;
-        for (const auto& c : m_cfg.channels) {
-            long long n = llround((c.freqHz - m_cfg.vchanBaseFreqHz) /
-                                  m_cfg.spacingHz());
-            double snapped = m_cfg.vchanBaseFreqHz + double(n) * m_cfg.spacingHz();
+        for (size_t i = 0; i < m_cfg.channels.size(); ++i) {
+            const auto& c = m_cfg.channels[i];
+            const double base = (int(i) == m_cfg.controlIndex)
+                                    ? m_cfg.ccBaseFreqHz
+                                    : m_cfg.vchanBaseFreqHz;
+            long long n = llround((c.freqHz - base) / m_cfg.spacingHz());
+            double snapped = base + double(n) * m_cfg.spacingHz();
             if (std::fabs(snapped - c.freqHz) > 1.0)
                 offGrid = true;
         }
@@ -327,11 +334,19 @@ void SitePanel::renderChannelPlan() {
 
     if (ImGui::CollapsingHeader("Advanced IDEN")) {
         int iden = m_cfg.chanId;
-        ImGui::Text("IDEN # (0-15)");
+        ImGui::Text("Control IDEN # (0-15)");
         ImGui::SetNextItemWidth(-FLT_MIN);
         if (ImGui::InputInt("##chanid", &iden))
             m_cfg.chanId = uint8_t(std::min(15, std::max(0, iden)));
-        ImGui::TextDisabled("Base is auto-set to the lowest plan frequency.");
+
+        int viden = m_cfg.voiceChanId;
+        ImGui::Text("Voice IDEN # (0-15)");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputInt("##voicechanid", &viden))
+            m_cfg.voiceChanId = uint8_t(std::min(15, std::max(0, viden)));
+
+        ImGui::TextDisabled("CC base = control frequency (ch 0). Voice base = one "
+                            "spacing below the lowest VC (first VC = ch 1).");
     }
 }
 

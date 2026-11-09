@@ -49,7 +49,7 @@ void CCPanel::render(const SiteConfig& cfg) {
     ImGui::Text("CC: %.5f MHz  (IDEN %u, ch %u)",
                 cfg.ccFreqHz / 1e6, unsigned(cfg.chanId), unsigned(cfg.ccChanNum));
     ImGui::Text("VC: %.5f MHz  (IDEN %u, ch %u)",
-                cfg.voiceFreqHz() / 1e6, unsigned(cfg.chanId), unsigned(cfg.vChanNum));
+                cfg.voiceFreqHz() / 1e6, unsigned(cfg.voiceChanId), unsigned(cfg.vChanNum));
 
     if (!m_startError.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
