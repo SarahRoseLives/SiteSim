@@ -229,6 +229,40 @@ if(WIN32)
     endif()
 endif()
 
+# ── SoapySDR device modules (Linux/macOS hint) ──────────────────────────────
+# The ADALM-Pluto needs the SoapyPlutoSDR plugin at runtime. On Windows the
+# build bundles the modules; elsewhere they are loaded from the system SoapySDR
+# module path, so just surface a hint when it is missing.
+if(NOT WIN32)
+    set(_soapy_module_dirs "")
+    if(DEFINED SOAPY_MODULE_DIRS)
+        list(APPEND _soapy_module_dirs ${SOAPY_MODULE_DIRS})
+    endif()
+    pkg_get_variable(_soapy_libdir SoapySDR libdir)
+    if(_soapy_libdir)
+        file(GLOB _sys_soapy_mod_dirs "${_soapy_libdir}/SoapySDR/modules*")
+        list(APPEND _soapy_module_dirs ${_sys_soapy_mod_dirs})
+    endif()
+    if(DEFINED ENV{SOAPY_SDR_PLUGIN_PATH})
+        list(APPEND _soapy_module_dirs "$ENV{SOAPY_SDR_PLUGIN_PATH}")
+    endif()
+
+    set(_have_pluto_module FALSE)
+    foreach(_md IN LISTS _soapy_module_dirs)
+        file(GLOB _pluto_mods "${_md}/*[Pp]luto*")
+        if(_pluto_mods)
+            set(_have_pluto_module TRUE)
+        endif()
+    endforeach()
+    if(_have_pluto_module)
+        message(STATUS "SiteSim: ADALM-Pluto SoapySDR module found")
+    else()
+        message(STATUS "SiteSim: SoapyPlutoSDR module not found — install your "
+                       "distro's SoapyPlutoSDR package (e.g. soapysdr-module-plutosdr "
+                       "or soapyplutosdr) to use an ADALM-Pluto; see COMPILE.md")
+    endif()
+endif()
+
 # ── subscriber_test (Go + cgo/libhackrf) ─────────────────────────────────────
 # Built via the Go toolchain (cgo links libhackrf). Optional: only wired up when
 # `go` is found. Produces build/subscriber_test[.exe] alongside the C++ targets.
@@ -292,11 +326,14 @@ if(SITESIM_BUILD_SUBSCRIBER_TEST)
             COMMENT "Building subscriber_test (Go + libhackrf)"
             VERBATIM
         )
-        add_custom_target(subscriber_test ALL DEPENDS ${_subtest_out})
+        # The target name must differ from the produced file on non-Windows:
+        # there the output is ${CMAKE_BINARY_DIR}/subscriber_test, which would
+        # collide with a target of the same name in build.ninja.
+        add_custom_target(subscriber_test_go ALL DEPENDS ${_subtest_out})
 
         # Bundle its runtime DLLs (libhackrf + deps) on Windows.
         if(WIN32 AND LDD_EXECUTABLE)
-            add_custom_command(TARGET subscriber_test POST_BUILD
+            add_custom_command(TARGET subscriber_test_go POST_BUILD
                 COMMAND ${CMAKE_COMMAND}
                     -DEXE=${_subtest_out}
                     -DDEST_DIR=${CMAKE_BINARY_DIR}

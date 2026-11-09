@@ -7,9 +7,17 @@ sudo apt install build-essential cmake pkg-config ninja-build \
     libsoapysdr-dev libsdl2-dev libgl-dev \
     libhackrf-dev librtlsdr-dev \
     libsndfile1-dev libssl-dev libpulse-dev libusb-1.0-0-dev \
+    libcodec2-dev \
     soapysdr-module-hackrf soapysdr-module-rtlsdr \
     golang-go
+
+# ADALM-Pluto support (optional): SoapySDR device module + libiio backend.
+sudo apt install libiio-dev libad9361-dev soapysdr-module-plutosdr
 ```
+
+On Arch, the equivalents are `base-devel cmake ninja pkgconf soapysdr sdl2-compat
+libhackrf rtl-sdr libsndfile openssl libpulse libusb codec2 hackrf rtl-sdr
+soapyplutosdr libiio libad9361 go`.
 
 The full source of `dsd-neo` and `mbelib-neo` is vendored in `third_party/`
 (see `third_party/VENDORING.md`) and built from source automatically as part of
@@ -191,6 +199,27 @@ works for RX-only testing.
 
 To build the GUI + control-channel TX only (stub RX, no dsd-neo), configure with
 `-DSITESIM_ENABLE_DSDNEO=OFF`.
+
+## ADALM-Pluto on Linux
+
+Pluto support needs the `SoapyPlutoSDR` device module (plus libiio/libad9361);
+install your distribution's package (`soapysdr-module-plutosdr` on Debian/Ubuntu,
+`soapyplutosdr` on Arch, `SoapyPlutoSDR` on Fedora). The build prints a hint at
+configure time if the module is missing, and Device selection / `uplink_test
+--pluto` use it through SoapySDR — no extra CMake flags are required. Verify with:
+
+```bash
+SoapySDRUtil --info | grep -i pluto   # should list the "plutosdr" factory
+```
+
+If you built `SoapyPlutoSDR` into a custom prefix, point SiteSim at it with
+`-DSOAPY_MODULE_DIRS=/path/to/SoapySDR/modules0.8` or the `SOAPY_SDR_PLUGIN_PATH`
+environment variable.
+
+> Note: SoapyPlutoSDR **0.2.2** (still packaged by some distros) uses a fixed
+> 4096-sample TX buffer and its `writeStream` returns short counts. SiteSim
+> handles partial writes correctly, so 0.2.2 works, but upgrading to 0.2.4+
+> (which auto-sizes the TX buffer) reduces overhead.
 
 ## Running (Linux)
 

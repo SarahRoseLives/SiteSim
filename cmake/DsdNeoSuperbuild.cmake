@@ -130,8 +130,17 @@ ExternalProject_Add(dsd_neo_ep
 find_library(SNDFILE_LIB   NAMES sndfile libsndfile)
 find_library(RTLSDR_LIB    NAMES rtlsdr librtlsdr)
 find_library(USB_LIB       NAMES usb-1.0 libusb-1.0)
+# dsd-neo compiles in Codec2 (M17) when it is present, so mirror its optional
+# dependency on the SiteSim link line.
+find_library(CODEC2_LIB    NAMES codec2)
 find_package(OpenSSL)
 pkg_check_modules(PORTAUDIO portaudio-2.0)
+# On Linux/macOS dsd-neo uses its PulseAudio backend (PortAudio is Windows-only),
+# so its audio_pulse.c references the PulseAudio libraries.
+if(NOT WIN32)
+    pkg_check_modules(PULSEAUDIO libpulse)
+    pkg_check_modules(PULSEAUDIO_SIMPLE libpulse-simple)
+endif()
 # dsd-neo auto-detects libcurl (rdio export) and Codec2; include curl if the
 # build picked it up so the runtime lib's references resolve.
 find_package(CURL QUIET)
@@ -147,6 +156,14 @@ if(WIN32)
     set(_DSD_PLATFORM_LIBS ws2_32 ${ICONV_LIB} winmm setupapi ole32 uuid)
 else()
     set(_DSD_PLATFORM_LIBS "")
+    if(PULSEAUDIO_FOUND)
+        list(APPEND _DSD_PLATFORM_LIBS
+            ${PULSEAUDIO_SIMPLE_LIBRARIES} ${PULSEAUDIO_LIBRARIES})
+    endif()
+endif()
+
+if(CODEC2_LIB)
+    list(APPEND _DSD_PLATFORM_LIBS ${CODEC2_LIB})
 endif()
 
 if(CURL_FOUND)
