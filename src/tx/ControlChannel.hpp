@@ -9,6 +9,9 @@
 #include <thread>
 #include <mutex>
 #include <array>
+#include <algorithm>
+#include <chrono>
+#include <unordered_map>
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
@@ -260,6 +263,22 @@ struct SiteConfig {
     }
 };
 
+// One subscriber as seen by the site, for the live System Activity view.
+struct RadioActivity {
+    uint32_t unitId       = 0;
+    uint16_t talkgroup    = 0;
+    uint16_t activeChan   = 0;
+    uint8_t  activeIden   = 0;
+    double   activeFreqHz = 0.0;
+    bool     registered   = false;
+    bool     affiliated   = false;
+    bool     keyed        = false;
+    bool     emergency    = false;
+    bool     unitToUnit   = false;
+    std::chrono::steady_clock::time_point lastSeen{};
+    std::chrono::steady_clock::time_point keyedSince{};
+};
+
 class ControlChannel {
 public:
     explicit ControlChannel(SoapyTx& tx);
@@ -279,9 +298,23 @@ public:
     struct LogEntry { std::string msg; };
     std::vector<LogEntry> getLog(size_t maxEntries = 100) const;
 
+    // ── Subscriber activity (System Activity panel) ──────────────────────
+    // Thread-safe: updated from the RX thread, read by the UI thread.
+    void noteRegistration(uint32_t unit);
+    void noteAffiliation(uint32_t unit, uint16_t tgid);
+    void noteDeregistration(uint32_t unit);
+    void noteVoiceRequest(uint32_t unit, uint16_t tgid, uint8_t iden,
+                          uint16_t chan, double freqHz);
+    void noteUnitToUnit(uint32_t source, uint32_t target);
+    void noteEmergency(uint32_t unit, uint16_t tgid);
+    // Snapshot with the keyed state expired after a short hangtime.
+    std::vector<RadioActivity> radioSnapshot() const;
+
 private:
     void producerThread();
     void addLog(const std::string& msg);
+    RadioActivity& upsertRadioLocked(uint32_t unit);
+    void pruneRadiosLocked();
 
     SoapyTx&    m_tx;
     SiteConfig  m_cfg;
@@ -296,5 +329,8 @@ private:
 
     mutable std::mutex   m_logMutex;
     std::deque<LogEntry> m_log;
+
+    mutable std::mutex   m_activityMutex;
+    std::unordered_map<uint32_t, RadioActivity> m_radios;
 };
 

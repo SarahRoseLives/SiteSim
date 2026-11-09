@@ -196,3 +196,131 @@ void ControlChannel::producerThread() {
     }
 }
 
+
+// ── Subscriber activity ──────────────────────────────────────────────────────
+// A "keyed" flag is only inferred from the uplink request/grant (SiteSim does
+// not carry voice), so it expires after a short hangtime instead of waiting for
+// an unkey we cannot observe. Any later control-channel traffic from that unit
+// clears it immediately, since a radio cannot be on a voice channel and sending
+// control TSBKs at the same time.
+static constexpr auto kKeyedHangtime = std::chrono::seconds(3);
+static constexpr size_t kMaxTrackedRadios = 256;
+
+RadioActivity& ControlChannel::upsertRadioLocked(uint32_t unit)
+{
+    auto it = m_radios.find(unit);
+    if (it != m_radios.end())
+        return it->second;
+    if (m_radios.size() >= kMaxTrackedRadios)
+        pruneRadiosLocked();
+    RadioActivity r;
+    r.unitId = unit;
+    auto res = m_radios.emplace(unit, r);
+    return res.first->second;
+}
+
+void ControlChannel::pruneRadiosLocked()
+{
+    if (m_radios.empty()) return;
+    auto oldest = m_radios.begin();
+    for (auto it = m_radios.begin(); it != m_radios.end(); ++it)
+        if (it->second.lastSeen < oldest->second.lastSeen)
+            oldest = it;
+    m_radios.erase(oldest);
+}
+
+void ControlChannel::noteRegistration(uint32_t unit)
+{
+    std::lock_guard<std::mutex> lock(m_activityMutex);
+    auto& r = upsertRadioLocked(unit);
+    r.registered = true;
+    r.keyed      = false;   // back on the control channel, not on a voice call
+    r.emergency  = false;
+    r.lastSeen   = std::chrono::steady_clock::now();
+}
+
+void ControlChannel::noteAffiliation(uint32_t unit, uint16_t tgid)
+{
+    std::lock_guard<std::mutex> lock(m_activityMutex);
+    auto& r = upsertRadioLocked(unit);
+    r.registered = true;
+    r.affiliated = true;
+    r.keyed      = false;   // back on the control channel, not on a voice call
+    r.emergency  = false;
+    r.talkgroup  = tgid;
+    r.lastSeen   = std::chrono::steady_clock::now();
+}
+
+void ControlChannel::noteDeregistration(uint32_t unit)
+{
+    std::lock_guard<std::mutex> lock(m_activityMutex);
+    auto& r = upsertRadioLocked(unit);
+    r.registered = false;
+    r.affiliated = false;
+    r.keyed      = false;
+    r.emergency  = false;
+    r.lastSeen   = std::chrono::steady_clock::now();
+}
+
+void ControlChannel::noteVoiceRequest(uint32_t unit, uint16_t tgid, uint8_t iden,
+                                      uint16_t chan, double freqHz)
+{
+    std::lock_guard<std::mutex> lock(m_activityMutex);
+    auto& r = upsertRadioLocked(unit);
+    r.talkgroup    = tgid;
+    r.activeIden   = iden;
+    r.activeChan   = chan;
+    r.activeFreqHz = freqHz;
+    r.keyed        = true;
+    r.unitToUnit   = false;
+    r.keyedSince   = std::chrono::steady_clock::now();
+    r.lastSeen     = r.keyedSince;
+}
+
+void ControlChannel::noteUnitToUnit(uint32_t source, uint32_t target)
+{
+    std::lock_guard<std::mutex> lock(m_activityMutex);
+    auto& r = upsertRadioLocked(source);
+    r.keyed      = true;
+    r.unitToUnit = true;
+    r.keyedSince = std::chrono::steady_clock::now();
+    r.lastSeen   = r.keyedSince;
+    // Keep the target visible too, so an active unit-to-unit call lists both.
+    auto& t = upsertRadioLocked(target);
+    t.lastSeen = r.keyedSince;
+}
+
+void ControlChannel::noteEmergency(uint32_t unit, uint16_t tgid)
+{
+    std::lock_guard<std::mutex> lock(m_activityMutex);
+    auto& r = upsertRadioLocked(unit);
+    r.talkgroup  = tgid;
+    r.emergency  = true;
+    r.keyed      = true;
+    r.keyedSince = std::chrono::steady_clock::now();
+    r.lastSeen   = r.keyedSince;
+}
+
+std::vector<RadioActivity> ControlChannel::radioSnapshot() const
+{
+    std::lock_guard<std::mutex> lock(m_activityMutex);
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<RadioActivity> out;
+    out.reserve(m_radios.size());
+    for (const auto& kv : m_radios) {
+        RadioActivity r = kv.second;
+        if (r.keyed && now - r.keyedSince > kKeyedHangtime) {
+            r.keyed      = false;
+            r.emergency  = false;
+            r.unitToUnit = false;
+        }
+        out.push_back(r);
+    }
+    std::sort(out.begin(), out.end(),
+              [](const RadioActivity& a, const RadioActivity& b) {
+                  if (a.keyed != b.keyed) return a.keyed > b.keyed;
+                  if (a.emergency != b.emergency) return a.emergency > b.emergency;
+                  return a.lastSeen > b.lastSeen;
+              });
+    return out;
+}

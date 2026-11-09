@@ -26,7 +26,7 @@ The goal of the project is to let you stand up a small, understandable P25 site 
 
 This is the main application.
 
-It has a GUI for configuring a site, starts the control channel transmitter, runs the uplink receiver, and shows both TX and RX activity logs at the same time.
+It has a GUI for configuring a site, starts the control channel transmitter, runs the uplink receiver, and shows both TX and RX activity logs at the same time. A **System Activity** panel lists the subscribers the site has heard (registered / affiliated), shows which radio is currently keyed up, and displays the active call's talkgroup, source unit and granted voice channel.
 
 ### `uplink_test`
 

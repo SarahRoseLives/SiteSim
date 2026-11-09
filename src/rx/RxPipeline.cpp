@@ -387,6 +387,10 @@ void RxPipeline::handleIspTsbk(uint8_t opcode, const uint8_t raw12[12])
         for (int i = 0; i < 10; ++i)
             m_cc.queueTSBK(grant);
 
+        m_cc.noteVoiceRequest(src_id, tgid, m_cfg.voiceChanId, m_cfg.vChanNum,
+                              m_cfg.voiceChannelFrequency(m_cfg.vChanNum));
+        if (emrg) m_cc.noteEmergency(src_id, tgid);
+
         snprintf(buf, sizeof(buf),
                  "GRP_VCH_REQ  SRC:%-8u TGID:%-5u%s -> granted VC %.5f MHz (IDEN %u ch %u)",
                  src_id, tgid, emrg ? " [EMRG]" : "",
@@ -401,6 +405,7 @@ void RxPipeline::handleIspTsbk(uint8_t opcode, const uint8_t raw12[12])
         auto rsp = p25::BuildGrpAffRsp(false, 0, static_cast<uint16_t>(tgid),
                                        static_cast<uint16_t>(tgid), src_id);
         m_cc.queueTSBK(rsp);
+        m_cc.noteAffiliation(src_id, tgid);
 
         snprintf(buf, sizeof(buf), "GRP_AFF_REQ  SRC:%-8u TGID:%-5u -> queued AFF_RSP", src_id, tgid);
         m_log(buf);
@@ -411,6 +416,7 @@ void RxPipeline::handleIspTsbk(uint8_t opcode, const uint8_t raw12[12])
         // Queue Unit Registration Response
         auto rsp = p25::BuildURegRsp(true, m_cfg.sysid, src_id, src_id);
         m_cc.queueTSBK(rsp);
+        m_cc.noteRegistration(src_id);
 
         snprintf(buf, sizeof(buf), "U_REG_REQ    SRC:%-8u -> queued U_REG_RSP", src_id);
         m_log(buf);
@@ -418,12 +424,14 @@ void RxPipeline::handleIspTsbk(uint8_t opcode, const uint8_t raw12[12])
     }
 
     case P25_ISP_U_DE_REG_ACK: {
+        m_cc.noteDeregistration(src_id);
         snprintf(buf, sizeof(buf), "U_DE_REG_ACK SRC:%-8u", src_id);
         m_log(buf);
         break;
     }
 
     case P25_ISP_EMRG_ALRM_REQ: {
+        m_cc.noteEmergency(src_id, tgid);
         snprintf(buf, sizeof(buf), "EMRG_ALRM    SRC:%-8u TGID:%-5u *** EMERGENCY ***", src_id, tgid);
         m_log(buf);
         break;
@@ -431,6 +439,7 @@ void RxPipeline::handleIspTsbk(uint8_t opcode, const uint8_t raw12[12])
 
     case P25_ISP_UU_VCH_REQ: {
         uint32_t target = static_cast<uint32_t>((raw12[4] << 16) | (raw12[5] << 8) | raw12[6]);
+        m_cc.noteUnitToUnit(src_id, target);
         snprintf(buf, sizeof(buf), "UU_VCH_REQ   SRC:%-8u TARGET:%-8u", src_id, target);
         m_log(buf);
         break;
@@ -569,7 +578,7 @@ void RxPipeline::nativeSoapyThread(RxPipeline* self)
         double actBw = 0.0;
         try { actBw = dev->getBandwidth(SOAPY_SDR_RX, 0); } catch (...) {}
         snprintf(rb, sizeof(rb),
-                 "Soapy RX active req=%.0f actual=%.0f center=%.4f MHz off=%ld bw=%.0f",
+                 "Soapy RX active req=%.0f actual=%.0f center=%.4f MHz off=%d bw=%.0f",
                  double(self->m_nativeRate), actRate, double(center) / 1e6,
                  self->m_nativeOffsetHz, actBw);
         diag(rb);

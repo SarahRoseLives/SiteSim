@@ -51,6 +51,7 @@ set(SITESIM_SOURCES
     src/ui/App.cpp
     src/ui/SitePanel.cpp
     src/ui/CCPanel.cpp
+    src/ui/ActivityPanel.cpp
     src/ui/LogPanel.cpp
     ${IMGUI_SOURCES}
 )

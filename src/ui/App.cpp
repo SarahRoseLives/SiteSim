@@ -1,6 +1,7 @@
 #include "App.hpp"
 #include "ui/SitePanel.hpp"
 #include "ui/CCPanel.hpp"
+#include "ui/ActivityPanel.hpp"
 #include "ui/LogPanel.hpp"
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -198,6 +199,7 @@ void App::run() {
     // Panels live here so they capture references correctly
     SitePanel sitePanel(m_cc, m_tx, m_rx);
     CCPanel   ccPanel(m_cc, m_tx, m_rx);
+    ActivityPanel activityPanel(m_cc);
     LogPanel  logPanel(m_cc);
 
     // Wire RxPipeline log output to the RX log tab
@@ -230,6 +232,7 @@ void App::run() {
 
             sitePanel.render();
             ccPanel.render(sitePanel.config());
+            activityPanel.render();
             logPanel.render();
         }
 
@@ -277,11 +280,15 @@ void App::setupDocking() {
 
         ImGuiID left, right;
         ImGui::DockBuilderSplitNode(dockId, ImGuiDir_Left, 0.30f, &left, &right);
-        ImGuiID rightTop, rightBottom;
-        ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.40f, &rightBottom, &rightTop);
+        // Right column, top to bottom: Control Channel, System Activity, Logs.
+        ImGuiID rightBottom, rightRest;
+        ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.28f, &rightBottom, &rightRest);
+        ImGuiID rightMid, rightCC;
+        ImGui::DockBuilderSplitNode(rightRest, ImGuiDir_Down, 0.64f, &rightMid, &rightCC);
 
         ImGui::DockBuilderDockWindow("Site Config",     left);
-        ImGui::DockBuilderDockWindow("Control Channel", rightTop);
+        ImGui::DockBuilderDockWindow("Control Channel", rightCC);
+        ImGui::DockBuilderDockWindow("System Activity", rightMid);
         ImGui::DockBuilderDockWindow("Activity Log",    rightBottom);
 
         ImGui::DockBuilderFinish(dockId);
