@@ -89,10 +89,16 @@ When a valid uplink request is decoded, SiteSim can generate a matching control-
 For example:
 
 - a `GRP_AFF_REQ` can cause a `GRP_AFF_RSP` to be queued
-- a `GRP_VCH_REQ` causes a `GRP_VCH_GRANT` for the selected voice channel
+- a `GRP_VCH_REQ` causes a `GRP_VCH_GRANT` for the selected voice channel — but
+  only if the unit is registered and affiliated to the requested talkgroup;
+  otherwise the request is denied (no grant, so the radio gets no talk permit)
+  and the site sends a `GRP_AFF_Q` (Group Affiliation Query) to the unit asking
+  it to report its affiliation
 - a `U_REG_REQ` can cause a `U_REG_RSP` to be queued
+- a `U_DE_REG_REQ` (sent when a radio powers down or leaves the system) removes
+  the unit from the roster and is acknowledged with a `U_DE_REG_ACK`
 
-This means the uplink side and downlink side are tied together: subscriber actions heard on the uplink can immediately drive site behavior on the control channel.
+This means the uplink side and downlink side are tied together: subscriber actions heard on the uplink can immediately drive site behavior on the control channel. A control-channel restart (STOP/START TX) is treated as a site restart: the subscriber roster is cleared, so radios must re-register and re-affiliate before they can place calls.
 
 ## 4. Frequency model
 

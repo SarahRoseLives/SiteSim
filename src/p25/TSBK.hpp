@@ -8,8 +8,10 @@ namespace p25 {
 constexpr uint8_t TSBK_GRP_VCH_GRANT     = 0x00;
 constexpr uint8_t TSBK_GRP_VCH_GRANT_UPD = 0x02;
 constexpr uint8_t TSBK_GRP_AFF_RSP       = 0x28;
+constexpr uint8_t TSBK_GRP_AFF_Q         = 0x2A;  // ask a unit to report affiliation
 constexpr uint8_t TSBK_LOC_REG_RSP       = 0x2B;
 constexpr uint8_t TSBK_U_REG_RSP         = 0x2C;
+constexpr uint8_t TSBK_U_DE_REG_ACK      = 0x2F;  // acknowledge de-registration
 constexpr uint8_t TSBK_SYNC_BCAST        = 0x30;
 constexpr uint8_t TSBK_SEC_CC_BCAST      = 0x39;
 constexpr uint8_t TSBK_RFSS_STS_BCAST    = 0x3A;
@@ -73,11 +75,19 @@ std::array<uint8_t, 12> BuildGrpAffRsp(bool lg, uint8_t gav,
                                         uint16_t announceGroup, uint16_t talkgroup,
                                         uint32_t source);
 
+// GRP_AFF_Q (0x2A): ask a target unit to report its group affiliation.
+// Payload: reserved(16), TARGET_ADDRESS(24), SOURCE_ADDRESS(24).
+std::array<uint8_t, 12> BuildGrpAffQuery(uint32_t target, uint32_t source);
+
 std::array<uint8_t, 12> BuildLocRegRsp(uint8_t rv, uint16_t talkgroup,
                                         uint8_t rfssID, uint8_t siteID, uint32_t target);
 
 std::array<uint8_t, 12> BuildURegRsp(bool accepted, uint16_t sysID,
                                       uint32_t target, uint32_t source);
+
+// U_DE_REG_ACK (0x2F): acknowledge a unit de-registration. Payload:
+// reserved(8), WACN(20), SYSTEM(12), TARGET_ADDRESS(24).
+std::array<uint8_t, 12> BuildUDeRegAck(uint32_t wacn, uint16_t sysID, uint32_t target);
 
 std::array<uint8_t, 12> BuildAdjStsBcast(uint16_t adjSysID, uint8_t rfssID, uint8_t siteID,
                                           uint16_t chanID, uint16_t chanNum, uint8_t ssc);

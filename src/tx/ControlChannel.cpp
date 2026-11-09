@@ -23,6 +23,9 @@ void ControlChannel::configure(const SiteConfig& cfg) {
 
 bool ControlChannel::start() {
     if (m_running.load()) return true;
+    // A fresh start is a site restart: forget all registrations/affiliations so
+    // subscribers must re-register/affiliate before they can be granted a call.
+    clearActivity();
     // Keep the modulator at the transmitter's hardware sample rate. Full-duplex
     // Pluto uses 1.536 MS/s so TX and RX share the AD9361 baseband rate.
     if (m_tx.isOpen()) {
@@ -254,12 +257,9 @@ void ControlChannel::noteAffiliation(uint32_t unit, uint16_t tgid)
 void ControlChannel::noteDeregistration(uint32_t unit)
 {
     std::lock_guard<std::mutex> lock(m_activityMutex);
-    auto& r = upsertRadioLocked(unit);
-    r.registered = false;
-    r.affiliated = false;
-    r.keyed      = false;
-    r.emergency  = false;
-    r.lastSeen   = std::chrono::steady_clock::now();
+    // The radio has left the system: drop it from the roster so it no longer
+    // shows as registered/affiliated and cannot be granted a call.
+    m_radios.erase(unit);
 }
 
 void ControlChannel::noteVoiceRequest(uint32_t unit, uint16_t tgid, uint8_t iden,
@@ -323,4 +323,29 @@ std::vector<RadioActivity> ControlChannel::radioSnapshot() const
                   return a.lastSeen > b.lastSeen;
               });
     return out;
+}
+
+void ControlChannel::clearActivity()
+{
+    std::lock_guard<std::mutex> lock(m_activityMutex);
+    m_radios.clear();
+}
+
+bool ControlChannel::unitRegistered(uint32_t unit) const
+{
+    std::lock_guard<std::mutex> lock(m_activityMutex);
+    auto it = m_radios.find(unit);
+    if (it == m_radios.end()) return false;
+    return it->second.registered || it->second.affiliated;
+}
+
+bool ControlChannel::unitAffiliated(uint32_t unit, uint16_t tgid) const
+{
+    std::lock_guard<std::mutex> lock(m_activityMutex);
+    auto it = m_radios.find(unit);
+    if (it == m_radios.end()) return false;
+    const auto& r = it->second;
+    if (!r.registered || !r.affiliated) return false;
+    if (tgid != 0 && r.talkgroup != tgid) return false;
+    return true;
 }

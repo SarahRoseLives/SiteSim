@@ -178,6 +178,14 @@ std::array<uint8_t, 12> BuildGrpAffRsp(bool lg, uint8_t gav,
     return buildTSBK(true, TSBK_GRP_AFF_RSP, 0x00, args);
 }
 
+std::array<uint8_t, 12> BuildGrpAffQuery(uint32_t target, uint32_t source) {
+    // TIA-102.AABC Group Affiliation Query (OSP 0x2A):
+    //   octets 2..3 reserved, octets 4..6 TARGET_ADDRESS, octets 7..9 SOURCE_ADDRESS.
+    uint64_t args = (uint64_t(target & 0xFFFFFF) << 24) |
+                    uint64_t(source & 0xFFFFFF);
+    return buildTSBK(true, TSBK_GRP_AFF_Q, 0x00, args);
+}
+
 std::array<uint8_t, 12> BuildLocRegRsp(uint8_t rv, uint16_t talkgroup,
                                         uint8_t rfssID, uint8_t siteID, uint32_t target) {
     uint64_t args = (uint64_t(rv & 3) << 56) |
@@ -196,6 +204,15 @@ std::array<uint8_t, 12> BuildURegRsp(bool accepted, uint16_t sysID,
                     (uint64_t(target & 0xFFFFFF) << 24) |
                     uint64_t(source & 0xFFFFFF);
     return buildTSBK(true, TSBK_U_REG_RSP, 0x00, args);
+}
+
+std::array<uint8_t, 12> BuildUDeRegAck(uint32_t wacn, uint16_t sysID, uint32_t target) {
+    // TIA-102.AABC Unit De-Registration Acknowledge (OSP 0x2F):
+    //   octet 2 reserved, WACN (20 bits), SYSTEM (12 bits), TARGET_ADDRESS (24).
+    uint64_t args = (uint64_t(wacn & 0xFFFFF) << 36) |
+                    (uint64_t(sysID & 0xFFF) << 24) |
+                    uint64_t(target & 0xFFFFFF);
+    return buildTSBK(true, TSBK_U_DE_REG_ACK, 0x00, args);
 }
 
 std::array<uint8_t, 12> BuildAdjStsBcast(uint16_t adjSysID, uint8_t rfssID, uint8_t siteID,

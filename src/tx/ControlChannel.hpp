@@ -310,6 +310,12 @@ public:
     // Snapshot with the keyed state expired after a short hangtime.
     std::vector<RadioActivity> radioSnapshot() const;
 
+    // Access control for call handling. A fresh control-channel start forgets
+    // all subscribers (a real site restart loses registrations/affiliations).
+    void clearActivity();
+    bool unitRegistered(uint32_t unit) const;
+    bool unitAffiliated(uint32_t unit, uint16_t tgid) const;
+
 private:
     void producerThread();
     void addLog(const std::string& msg);

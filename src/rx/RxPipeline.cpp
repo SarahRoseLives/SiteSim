@@ -28,6 +28,13 @@
 #include <dsd-neo/runtime/p25_isp_hooks.h>
 #include <dsd-neo/runtime/p25_optional_hooks.h>
 
+// Group Affiliation Query Response (ISP 0x29): the radio's reply to an outbound
+// GRP_AFF_Q. dsd-neo's p25_isp_hooks.h does not define this one.
+constexpr uint8_t P25_ISP_GRP_AFF_Q_RSP = 0x29;
+// Unit De-Registration Request (ISP 0x2B): sent by a radio when it powers down
+// or leaves the system. (0x2F is the outbound acknowledge, not an inbound one.)
+constexpr uint8_t P25_ISP_U_DE_REG_REQ = 0x2B;
+
 #if defined(_WIN32)
 #include <io.h>
 #include <fcntl.h>
@@ -372,6 +379,23 @@ void RxPipeline::handleIspTsbk(uint8_t opcode, const uint8_t raw12[12])
     switch (opcode) {
 
     case P25_ISP_GRP_VCH_REQ: {
+        // A subscriber must be registered and affiliated (to this talkgroup)
+        // before the site grants it a voice channel. Without this a radio that
+        // never re-affiliated after a site/CC restart could still key up.
+        if (!m_cc.unitAffiliated(src_id, static_cast<uint16_t>(tgid))) {
+            // Prompt the radio to report/refresh its affiliation. An OSP
+            // GRP_AFF_Q addressed to it should make it answer with an ISP
+            // Group Affiliation Query Response (0x29); after that the retry is
+            // granted.
+            auto query = p25::BuildGrpAffQuery(src_id, 0);
+            for (int i = 0; i < 3; ++i)
+                m_cc.queueTSBK(query);
+            snprintf(buf, sizeof(buf),
+                     "GRP_VCH_REQ  SRC:%-8u TGID:%-5u -> DENIED (not affiliated); sent GRP_AFF_Q",
+                     src_id, tgid);
+            m_log(buf);
+            break;
+        }
         // Grant the voice channel selected in the site's channel plan.
         bool emrg = (options >> 7) & 1;
         auto grant = p25::BuildGrpVChGrant(
@@ -412,6 +436,19 @@ void RxPipeline::handleIspTsbk(uint8_t opcode, const uint8_t raw12[12])
         break;
     }
 
+    case P25_ISP_GRP_AFF_Q_RSP: {
+        // Reply to our outbound GRP_AFF_Q: announcement group (octets 3..4),
+        // group (5..6), source (7..9). Treat it as an affiliation report.
+        uint16_t group = static_cast<uint16_t>((raw12[5] << 8) | raw12[6]);
+        m_cc.noteAffiliation(src_id, group);
+        auto rsp = p25::BuildGrpAffRsp(false, 0, group, group, src_id);
+        m_cc.queueTSBK(rsp);
+        snprintf(buf, sizeof(buf),
+                 "GRP_AFF_QRSP SRC:%-8u GROUP:%-5u -> affiliated", src_id, group);
+        m_log(buf);
+        break;
+    }
+
     case P25_ISP_U_REG_REQ: {
         // Queue Unit Registration Response
         auto rsp = p25::BuildURegRsp(true, m_cfg.sysid, src_id, src_id);
@@ -423,9 +460,12 @@ void RxPipeline::handleIspTsbk(uint8_t opcode, const uint8_t raw12[12])
         break;
     }
 
-    case P25_ISP_U_DE_REG_ACK: {
+    case P25_ISP_U_DE_REG_REQ: {
+        // Radio powering down / leaving the system: forget it and acknowledge.
         m_cc.noteDeregistration(src_id);
-        snprintf(buf, sizeof(buf), "U_DE_REG_ACK SRC:%-8u", src_id);
+        auto ack = p25::BuildUDeRegAck(m_cfg.wacn, m_cfg.sysid, src_id);
+        m_cc.queueTSBK(ack);
+        snprintf(buf, sizeof(buf), "U_DE_REG_REQ SRC:%-8u -> de-registered", src_id);
         m_log(buf);
         break;
     }
@@ -439,6 +479,13 @@ void RxPipeline::handleIspTsbk(uint8_t opcode, const uint8_t raw12[12])
 
     case P25_ISP_UU_VCH_REQ: {
         uint32_t target = static_cast<uint32_t>((raw12[4] << 16) | (raw12[5] << 8) | raw12[6]);
+        if (!m_cc.unitRegistered(src_id)) {
+            snprintf(buf, sizeof(buf),
+                     "UU_VCH_REQ   SRC:%-8u TARGET:%-8u -> DENIED (unit not registered)",
+                     src_id, target);
+            m_log(buf);
+            break;
+        }
         m_cc.noteUnitToUnit(src_id, target);
         snprintf(buf, sizeof(buf), "UU_VCH_REQ   SRC:%-8u TARGET:%-8u", src_id, target);
         m_log(buf);
