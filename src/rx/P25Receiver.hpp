@@ -42,6 +42,11 @@ public:
         // Coarse symbol-value histogram, bins over [-6,+6] (24 bins).
         uint64_t symHist[24] = {0};
         float    symMin = 1e9f, symMax = -1e9f;
+        // FSW-derived slicer normalisation of the last extracted frame:
+        // amp ~1.0 and dc ~0 mean the radio's deviation matches the assumed
+        // 1800 Hz peak; amp < 1 indicates a lower-deviation uplink.
+        float    lastAmp = 1.0f;
+        float    lastDc  = 0.0f;
     };
 
     P25Receiver();

@@ -548,14 +548,30 @@ void RxPipeline::nativeSoapyThread(RxPipeline* self)
         long center = long(self->m_cfg.rxFreqHz()) + self->m_nativeOffsetHz;
         dev->setFrequency(SOAPY_SDR_RX, 0, double(center));
         try { dev->setGainMode(SOAPY_SDR_RX, 0, true); } catch (...) {}
+        // On a shared Pluto the site's own TX is only a few MHz away, and the
+        // AD9361's RX RF bandwidth is left at the firmware default by the
+        // SoapyPlutoSDR module. That wide front-end passes the TX leak and its
+        // AGC desenses the uplink. Request a narrow bandwidth that still covers
+        // the deliberate RX offset (180 kHz) but rejects the TX carrier.
+        const bool sharedPluto = self->m_shareDevice &&
+            (self->m_soapyProfile.find("pluto") != std::string::npos ||
+             self->m_soapyArgs.find("pluto") != std::string::npos);
+        if (sharedPluto) {
+            const double bw = 600e3;
+            try { dev->setBandwidth(SOAPY_SDR_RX, 0, bw); } catch (...) {}
+        }
         stream = dev->setupStream(SOAPY_SDR_RX, "CF32");
         if (!stream) throw std::runtime_error("setupStream failed");
         dev->activateStream(stream);
-        char rb[160];
+        char rb[192];
         double actRate = double(self->m_nativeRate);
         try { actRate = dev->getSampleRate(SOAPY_SDR_RX, 0); } catch (...) {}
-        snprintf(rb, sizeof(rb), "Soapy RX active req=%.0f actual=%.0f center=%.4f MHz off=%ld",
-                 double(self->m_nativeRate), actRate, double(center) / 1e6, self->m_nativeOffsetHz);
+        double actBw = 0.0;
+        try { actBw = dev->getBandwidth(SOAPY_SDR_RX, 0); } catch (...) {}
+        snprintf(rb, sizeof(rb),
+                 "Soapy RX active req=%.0f actual=%.0f center=%.4f MHz off=%ld bw=%.0f",
+                 double(self->m_nativeRate), actRate, double(center) / 1e6,
+                 self->m_nativeOffsetHz, actBw);
         diag(rb);
     } catch (const std::exception& e) {
         diag(std::string("Soapy RX setup failed: ") + e.what());
@@ -593,13 +609,14 @@ void RxPipeline::nativeSoapyThread(RxPipeline* self)
                 char b[160];
                 const auto& st = self->m_rx->stats();
                 snprintf(b, sizeof(b),
-                         "rx rms=%.4f syms=%llu fsw=%llu nid=%llu tsbk=%llu fswD=%d invD=%d smin=%.1f smax=%.1f",
+                         "rx rms=%.4f syms=%llu fsw=%llu nid=%llu tsbk=%llu fswD=%d invD=%d smin=%.1f smax=%.1f amp=%.2f dc=%.2f",
                          std::sqrt(rmsAcc / double(rmsN)),
                          (unsigned long long)st.symbols,
                          (unsigned long long)st.fswHits,
                          (unsigned long long)st.nidOk,
                          (unsigned long long)st.tsbks,
-                         st.minFswDist, st.minFswDistInv, st.symMin, st.symMax);
+                         st.minFswDist, st.minFswDistInv, st.symMin, st.symMax,
+                         st.lastAmp, st.lastDc);
                 diag(b);
                 chunks = 0; rmsAcc = 0; rmsN = 0;
             }

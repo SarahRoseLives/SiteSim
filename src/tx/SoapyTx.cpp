@@ -128,6 +128,12 @@ bool SoapyTx::open(const std::string& args) {
         m_device->setSampleRate(SOAPY_SDR_TX, 0, m_sampleRate);
         try { m_actualSampleRate = m_device->getSampleRate(SOAPY_SDR_TX, 0); }
         catch (...) { m_actualSampleRate = m_sampleRate; }
+        // Keep the Pluto's TX emission inside its own channel. The AD9361 leaves
+        // the RF bandwidth at the firmware default otherwise, and on a single
+        // radio the broadband TX leakage desenses the co-located RX.
+        if (isPluto()) {
+            try { m_device->setBandwidth(SOAPY_SDR_TX, 0, 200e3); } catch (...) {}
+        }
         applyFrequencyChecked(m_frequency);
         m_device->setGain(SOAPY_SDR_TX, 0, m_gain);
         // HackRF's "AMP" gain stage; other drivers may map the named setter
@@ -368,20 +374,38 @@ void SoapyTx::txThread() {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
-        void* ptrs[1] = { buf.data() };
-        int flags = 0;
-        long long timeNs = 0;
-        int ret = m_device->writeStream(m_stream, ptrs, kChunkSamples, flags, timeNs, 1000000);
-        if (ret < 0) {
-            // Timeouts are normal under backpressure; anything else is worth
-            // surfacing in the UI once.
-            if (ret != SOAPY_SDR_TIMEOUT && !m_writeErrorReported) {
-                setError(std::string("TX writeStream failed: ") + SoapySDR::errToStr(ret));
-                m_writeErrorReported = true;
+        // writeStream is allowed to accept fewer samples than requested. In
+        // particular SoapyPlutoSDR 0.2.2 uses a fixed 4096-sample TX buffer, so
+        // an 8192-sample chunk comes back as 4096 then 0 (after its internal
+        // flush). Consume the chunk in a loop; otherwise the remainder is
+        // dropped and the transmitted C4FM stream is corrupted.
+        size_t offset = 0;
+        while (m_running.load() && offset < size_t(kChunkSamples)) {
+            void* ptrs[1] = { buf.data() + offset * 2 };
+            int flags = 0;
+            long long timeNs = 0;
+            int ret = m_device->writeStream(
+                m_stream, ptrs, kChunkSamples - offset, flags, timeNs, 1000000);
+            if (ret > 0) {
+                offset += size_t(ret);
+                if (m_writeErrorReported) {
+                    setError("");
+                    m_writeErrorReported = false;
+                }
+            } else if (ret == 0 || ret == SOAPY_SDR_TIMEOUT) {
+                // 0 means the driver flushed its internal buffer (retry now);
+                // a timeout is normal backpressure. Do not sleep 1 ms here or
+                // real-time TX can fall behind and underrun.
+                std::this_thread::yield();
+            } else {
+                // Timeouts are normal under backpressure; anything else is worth
+                // surfacing in the UI once. Drop the rest of this chunk.
+                if (!m_writeErrorReported) {
+                    setError(std::string("TX writeStream failed: ") + SoapySDR::errToStr(ret));
+                    m_writeErrorReported = true;
+                }
+                break;
             }
-        } else if (m_writeErrorReported) {
-            setError("");
-            m_writeErrorReported = false;
         }
     }
 

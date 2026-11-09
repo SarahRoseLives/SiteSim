@@ -340,6 +340,33 @@ void P25Receiver::tryExtract()
         return;
     }
 
+    // The Pluto's RX clock and the radio's TX clock are independent, so the
+    // uplink can arrive a few hundred Hz to a few kHz off frequency. That adds
+    // a DC bias to the discriminator (outer is only +/-1800 Hz, inner +/-600 Hz),
+    // which the slow m_dc tracker cannot remove within one short burst. Fit the
+    // known 24-symbol FSW (received = amp*template + dc) and remove the residual
+    // offset; normalise by amp as well so a different radio deviation still
+    // lands on the +/-1/3 slicer.
+    double meanR = 0.0, meanT = 0.0;
+    float rsw[24];
+    for (int k = 0; k < 24; ++k) {
+        rsw[k]  = interpAt(bestPos + double(k) * sps);
+        meanR  += double(rsw[k]);
+        meanT  += double(tmpl[k]);
+    }
+    meanR /= 24.0; meanT /= 24.0;
+    double cov = 0.0, varT = 0.0;
+    for (int k = 0; k < 24; ++k) {
+        cov  += (double(rsw[k]) - meanR) * (double(tmpl[k]) - meanT);
+        varT += (double(tmpl[k]) - meanT) * (double(tmpl[k]) - meanT);
+    }
+    double amp = (varT > 1e-9) ? cov / varT : 1.0;
+    if (!(amp > 0.2)) amp = 0.2;      // also catches NaN
+    if (amp > 5.0) amp = 5.0;
+    const double dc = meanR - amp * meanT;
+    m_stats.lastAmp = float(amp);
+    m_stats.lastDc  = float(dc);
+
     // Frame dibit j sits at on-air symbol j + floor((j-1)/ss); resample it there.
     // Integrate over the symbol (matched filter) for noise rejection rather than
     // sampling a single point; with FSW-locked timing this is stable.
@@ -347,6 +374,7 @@ void P25Receiver::tryExtract()
     for (int j = 25; j <= 154; ++j) {
         int oa = (ss > 0) ? (j + (j - 1) / ss) : j;   // 1-based on-air symbol index
         float s = integrateDump(bestPos + double(oa - 1) * sps);
+        s = float((double(s) - dc) / amp);
         uint8_t d = sliceValue(s, 2.0f);
         if (m_invert) d ^= 0x2;
         m_frameBuf[j - 25] = d;
