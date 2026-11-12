@@ -130,9 +130,12 @@ bool SoapyTx::open(const std::string& args) {
         catch (...) { m_actualSampleRate = m_sampleRate; }
         // Keep the Pluto's TX emission inside its own channel. The AD9361 leaves
         // the RF bandwidth at the firmware default otherwise, and on a single
-        // radio the broadband TX leakage desenses the co-located RX.
+        // radio the broadband TX leakage desenses the co-located RX. A composite
+        // CC+voice stream widens this to cover both downlinks.
         if (isPluto()) {
-            try { m_device->setBandwidth(SOAPY_SDR_TX, 0, 200e3); } catch (...) {}
+            const double bw = m_txBandwidth > 0.0 ? m_txBandwidth : 200e3;
+            try { m_device->setBandwidth(SOAPY_SDR_TX, 0, bw); } catch (...) {}
+            m_txBandwidthDirty = false;
         }
         applyFrequencyChecked(m_frequency);
         m_device->setGain(SOAPY_SDR_TX, 0, m_gain);
@@ -273,6 +276,21 @@ void SoapyTx::setSampleRate(double sps) {
     }
 }
 
+void SoapyTx::setTxBandwidth(double hz) {
+    m_txBandwidth = hz;
+    // Re-configuring the AD9361 RF bandwidth while a stream is live can crash
+    // or glitch the Pluto driver. Apply it now only when idle; otherwise mark
+    // it for the TX thread to apply before activateStream on the next start.
+    if (m_device && !m_running.load()) {
+        try {
+            m_device->setBandwidth(SOAPY_SDR_TX, 0, hz);
+            m_txBandwidthDirty = false;
+        } catch (...) {}
+    } else {
+        m_txBandwidthDirty = true;
+    }
+}
+
 size_t SoapyTx::ringAvailable() const {
     size_t w = m_wpos.load(std::memory_order_acquire);
     size_t r = m_rpos.load(std::memory_order_acquire);
@@ -345,6 +363,12 @@ void SoapyTx::txThread() {
     }
 
     try {
+        // Apply any bandwidth requested while the stream was stopped (the
+        // AD9361 must not be reconfigured underneath a live stream).
+        if (m_txBandwidthDirty && m_txBandwidth > 0.0) {
+            try { m_device->setBandwidth(SOAPY_SDR_TX, 0, m_txBandwidth); } catch (...) {}
+            m_txBandwidthDirty = false;
+        }
         int rc = m_device->activateStream(m_stream);
         if (rc != 0) {
             setError(std::string("TX activateStream failed: ") + SoapySDR::errToStr(rc));

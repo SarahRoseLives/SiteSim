@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>
 #include <array>
@@ -10,7 +11,7 @@
 // Forward-declare dsd-neo C types to avoid pulling all headers into App.hpp
 struct dsd_opts;
 struct dsd_state;
-namespace p25rx { class P25Receiver; }
+namespace p25rx { class P25Receiver; class VoiceRepeater; }
 
 /**
  * RxPipeline — wraps the dsd-neo engine for P25P1 site-input reception.
@@ -60,6 +61,10 @@ public:
     bool isSoapy() const { return m_soapy; }
     std::string sourceName() const;
 
+    // Voice repeater fed from the same composite RX stream. Non-null after
+    // configure(); configure() computes its mix offset and start() enables it.
+    p25rx::VoiceRepeater* voiceRepeater() const { return m_voice.get(); }
+
 private:
     static void engineThread(RxPipeline* self);
 
@@ -105,6 +110,22 @@ private:
     int          m_nativeOffsetHz = 180000;   // tune offset to dodge DC spike
     uint32_t     m_nativeRate  = 1536000;
     p25rx::P25Receiver* m_rx   = nullptr;
+    // Second native receiver on the voice channel; its NID/DUID decode gates
+    // the voice repeater so only real P25 voice frames (not noise or leaked
+    // control traffic) key the repeat path.
+    p25rx::P25Receiver* m_voiceRx = nullptr;
+
+    // Composite CC + voice reception. When enabled, the RX is centred between
+    // the control-channel and voice-channel uplinks and one stream feeds both
+    // the CC receiver and the voice repeater.
+    std::unique_ptr<p25rx::VoiceRepeater> m_voice;
+    bool   m_voiceEnabled = false;
+    double m_rxCenterHz   = 0.0;
+    double m_ccMixHz      = 180000.0;
+    double m_vcMixHz      = 0.0;
+    double m_rxBandwidthHz = 600e3;
+    void updateCompositePlan();
+
     std::thread  m_nativeThread;
     std::atomic<bool> m_nativeStop{false};
     void startNative();

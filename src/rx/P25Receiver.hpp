@@ -1,4 +1,6 @@
 #pragma once
+#include "p25/NID.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +28,10 @@ namespace p25rx {
 class P25Receiver {
 public:
     using TsbkCallback = std::function<void(const std::array<uint8_t, 12>& tsbk)>;
+    // Called for every frame whose NID decodes (any DUID, matching the NAC).
+    // Lets the voice path distinguish real P25 voice frames (HDU/LDU/TDU) from
+    // control TSBKs or noise.
+    using FrameCallback = std::function<void(uint16_t nac, uint8_t duid)>;
     using LogCallback  = std::function<void(const std::string&)>;
 
     struct Stats {
@@ -56,6 +62,11 @@ public:
     bool configure(double sampleRateHz, uint16_t nac = 0);
 
     void setTsbkCallback(TsbkCallback cb) { m_onTsbk = std::move(cb); }
+    void setFrameCallback(FrameCallback cb) { m_onFrame = std::move(cb); }
+    // Restrict NID decoding to a set of DUIDs (bit per DUID value). The control
+    // channel defaults to TSBK only, which preserves its error-correction
+    // performance; the voice receiver opts into the voice DUIDs.
+    void setDuidMask(uint16_t mask) { m_duidMask = mask ? mask : 0xFFFFu; }
     void setLogCallback(LogCallback cb)   { m_onLog  = std::move(cb); }
     void setInvert(bool inv) { m_invert = inv; }   // flip C4FM polarity
     void setSsInterval(int n) { if (n >= 0) m_ssInterval = n; }
@@ -133,7 +144,9 @@ private:
 
     Stats         m_stats;
     TsbkCallback  m_onTsbk;
+    FrameCallback m_onFrame;
     LogCallback   m_onLog;
+    uint16_t      m_duidMask = uint16_t(1u << p25::DUID_TSBK);
 
     void pushDibit(uint8_t d);
     void tryExtract();

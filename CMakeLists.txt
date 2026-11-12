@@ -48,6 +48,7 @@ set(SITESIM_SOURCES
     src/tx/SoapyTx.cpp
     src/tx/ControlChannel.cpp
     src/rx/RxPipeline.cpp    src/rx/P25Receiver.cpp
+    src/rx/VoiceRepeater.cpp
     src/ui/App.cpp
     src/ui/SitePanel.cpp
     src/ui/CCPanel.cpp
@@ -65,6 +66,7 @@ set(SITESIM_CORE_SOURCES
     src/tx/SoapyTx.cpp
     src/tx/ControlChannel.cpp
     src/rx/RxPipeline.cpp    src/rx/P25Receiver.cpp
+    src/rx/VoiceRepeater.cpp
 )
 
 add_executable(uplink_test

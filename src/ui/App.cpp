@@ -314,10 +314,10 @@ void App::renderMenuBar() {
             for (size_t i = 0; i < m_deviceList.size(); i++) {
                 bool isCurrent = m_tx.isOpen() && (m_deviceList[i] == m_tx.argsString());
                 if (ImGui::MenuItem(m_deviceList[i].c_str(), nullptr, isCurrent)) {
-                    // Stop RX before closing the device: on a shared Pluto the
-                    // RX stream is using this same handle.
-                    if (m_rx.isRunning()) m_rx.stop();
+                    // Stop the control-channel mixer before tearing down RX: it
+                    // reads the voice repeater owned by the RX pipeline.
                     if (m_cc.isRunning()) m_cc.stop();
+                    if (m_rx.isRunning()) m_rx.stop();
                     m_tx.stopTx();
                     m_tx.close();
                     m_tx.setSampleRate(deviceArgsLookLikePluto(m_deviceList[i]) ? 1536000.0 : 2400000.0);
@@ -375,8 +375,9 @@ void App::shutdown() {
     // If the window is closed during the initial device scan, wait for the
     // worker before touching m_tx from this thread.
     if (m_scanThread.joinable()) m_scanThread.join();
-    if (m_rx.isRunning()) m_rx.stop();
+    // Stop the CC mixer first; it reads the voice repeater owned by RxPipeline.
     if (m_cc.isRunning()) m_cc.stop();
+    if (m_rx.isRunning()) m_rx.stop();
     m_tx.stopTx();
     m_tx.close();
 

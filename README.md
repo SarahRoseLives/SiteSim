@@ -64,13 +64,19 @@ The chain is the inverse of the transmitter:
 
 - capture IQ — RTL-SDR via librtlsdr directly, or the shared SoapySDR device for a Pluto
 - downconvert the deliberately off-centre capture to baseband (the RX is tuned
-  away from the signal so it does not sit on the tuner DC spike) and decimate to
-  ~48 kHz
+  away from the signal so it does not sit on the tuner DC spike) and decimate
+  with an anti-alias FIR: the control channel to ~48 kHz, the voice repeater to
+  ~96 kHz
 - FM discriminator, then symbol timing locked per burst by **correlating the
   48-bit frame-sync word** (robust on short uplink bursts where a free-running
   timing loop would not settle)
 - integrate over each symbol (matched filter), slice the 4-level C4FM
 - NID (BCH) → de-interleave → 4-state Viterbi → CRC-16 to recover the TSBK
+
+When voice repeat is active the RX is centred **between** the control-channel
+and voice-channel uplinks, and the same IQ stream feeds both the CC receiver and
+the voice repeater. The anti-alias FIRs keep the two adjacent channels from
+folding into each other.
 
 Examples of uplink traffic the receiver understands:
 
@@ -100,7 +106,61 @@ For example:
 
 This means the uplink side and downlink side are tied together: subscriber actions heard on the uplink can immediately drive site behavior on the control channel. A control-channel restart (STOP/START TX) is treated as a site restart: the subscriber roster is cleared, so radios must re-register and re-affiliate before they can place calls.
 
-## 4. Frequency model
+## 4. Voice repeat (composite CC + VC)
+
+SiteSim can act as the voice repeater for the call it grants, so two subscribers
+on the same talkgroup can talk to each other through the site. This is
+**opt-in** via the *Repeat voice (composite CC + VC TX/RX)* checkbox in Site
+Config and is **off by default**; with it off the site uses the proven narrow
+CC-only tuning.
+
+> **Status / known limitation:** talk permit and channel grants work, but
+> on-air voice traversal has **not yet been validated**. On a single
+> full-duplex Pluto with the usual 5 MHz split and no duplexer, the
+> subscriber's TX and the site's own TX desense the site receiver and nearby
+> radios (co-site blocking), so the voice path is currently unreliable. That is
+> an RF-isolation problem, not a demodulator problem: use a separate RX (for
+> example an RTL-SDR with a 433 MHz bandpass and attenuator), separate TX/RX
+> ports/antennas, a larger duplex offset, or a proper duplexer before enabling
+> voice repeat. Two subscribers sitting next to each other will also desense
+> each other regardless of the site.
+
+With a single full-duplex radio (ADALM-Pluto) the site transmits **both** the
+control channel and the active voice channel at the same time in one wideband
+TX stream, and receives both uplinks in one wideband RX stream:
+
+- The TX LO stays on the control-channel downlink; the repeated voice is mixed
+  to `VC − CC` (e.g. −500 kHz) and added to the CC baseband. The TX RF
+  bandwidth is widened to cover both carriers.
+- The RX is centred on the midpoint of the two uplinks. The CC receiver and the
+  voice repeater each mix their own channel to baseband, so the control channel
+  never drops while voice is active — radios can rejoin the CC, request a new
+  channel, or PTT again normally.
+- The voice repeater is symbol-agnostic: it FM-discriminates the talker's
+  already-shaped C4FM uplink and re-modulates it on the voice downlink. The
+  talker's HDU/LDU/TDU framing, NAC, link control and IMBE payload pass through
+  unchanged, so no vocoder is involved and the listener hears the talker
+  exactly as the repeater received them.
+- A second native receiver decodes the voice channel's NID and the repeat gate
+  is driven by real voice frames (HDU/LDU/TDU with the site NAC), not raw
+  energy. Idle noise, adjacent-channel energy and the site's own TX leakage
+  cannot hold the repeat open; a 1 s hang keeps the tail of a transmission and
+  a 30 s time-out timer breaks a stuck/feedback condition.
+
+This requires the control channel and the selected voice channel to be far
+enough apart for one radio to cover both. They must be at least **100 kHz**
+apart; when voice repeat is enabled and they are, the **Control Channel** panel
+reports `Voice repeat: listening` / `REPEATING` (or `off` when disabled or when
+the plan is too narrow). At 1.536 MS/s the usable span is about ±600 kHz, so the
+default 500 kHz CC/VC separation fits comfortably. A call uses the single voice
+channel selected in the plan; both radios share it for the call and its
+hangtime.
+
+If the site does not have a wideband RX path (for example a HackRF TX with an
+RTL-SDR, which can still cover both uplinks at 1.536 MS/s), select **Uplink RX on
+RTL-SDR**; the same composite logic runs against the RTL stream.
+
+## 5. Frequency model
 
 SiteSim uses an editable **channel plan** instead of two fixed frequency boxes.
 Add as many 2m/70cm channels as you need, then click the **CC** radio button on
@@ -128,13 +188,13 @@ voice plan does not fit in the 4095-step IDEN range.
 
 Defaults are SYSID `0x123`, a 12.5 kHz 70cm plan (control `438.8000`, voice
 `438.3000`, `438.3125`, `438.3250` MHz), and a −5 MHz uplink split
-(control uplink `433.8000` MHz). The VCs sit below the CC on purpose: the site
-receiver is tuned ~180 kHz above the control uplink to dodge its DC spike, so
-voice uplinks below the CC fall outside that RX passband and do not desense it.
-Edit the uplink field for your repeater's actual input; the offset sent in
-`IDEN_UP` follows.
+(control uplink `433.8000` MHz). The VCs sit 500 kHz below the CC, which keeps
+the CC and voice uplinks comfortably inside one composite RX passband and lets
+the site repeat voice while the control channel stays on the air. Edit the
+uplink field for your repeater's actual input; the offset sent in `IDEN_UP`
+follows.
 
-## 5. Radio backends
+## 6. Radio backends
 
 SiteSim uses SoapySDR for the transmitter and its own native receiver for the uplink.
 
@@ -148,6 +208,12 @@ SiteSim uses SoapySDR for the transmitter and its own native receiver for the up
   independently (control channel vs. site input) and both run at 1.536 MS/s so
   the AD9361 baseband rate is shared. The Pluto is preferred automatically when
   present; the **Device** menu lets you choose another SoapySDR device.
+  A **Pluto+** (2 TX + 2 RX ports) behaves the same as a stock Pluto here:
+  SoapyPlutoSDR exposes channel 0 for each direction, and the AD9361's two RX
+  channels share one RX LO (as do the two TX channels), so the extra ports do
+  not provide a second independently tuned receiver. They are still useful:
+  feed TX and RX from separate ports/antennas for better full-duplex isolation,
+  which is exactly what the composite CC+voice stream wants.
 
 The native receiver has no external runtime dependency; `dsd-neo` remains
 vendored in the tree but is not required for the receive path.
@@ -192,6 +258,7 @@ The project is normally exercised in stages:
 2. Prove `subscriber_test` can generate valid ISP traffic.
 3. Move back to full `sitesim`.
 4. Confirm that an uplink request seen in the RX log results in a matching downlink response seen on the control channel.
+5. With two subscribers affiliated to the same talkgroup, key one up and confirm the **Control Channel** panel shows `Voice repeat: REPEATING` and the other radio hears it.
 
 ## Current intent of the codebase
 
@@ -201,6 +268,7 @@ The emphasis is on:
 
 - making control-channel behavior visible
 - making uplink traffic easy to inspect
+- repeating granted voice calls so subscribers can talk through the site
 - validating subscriber interactions end-to-end
 - keeping the tooling approachable enough to test without real subscriber hardware
 

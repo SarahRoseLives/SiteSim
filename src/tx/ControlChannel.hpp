@@ -16,6 +16,8 @@
 #include <cmath>
 #include <cstdio>
 
+namespace p25rx { class VoiceRepeater; }
+
 struct SiteConfig {
     // One row in the user-entered channel plan.
     struct Channel {
@@ -50,6 +52,11 @@ struct SiteConfig {
     // MFID-90 messages and SEC_CC. This is a provably standard control channel
     // used to isolate whether a fabricated broadcast is preventing lock.
     bool     minimalCc     = false;
+
+    // Composite voice repeat: transmit the granted voice channel alongside the
+    // CC and receive both uplinks. Opt-in because it widens the TX/RX RF
+    // bandwidth; with it off the site uses the narrow CC-only tuning.
+    bool     voiceRepeat   = false;
 
     // Run the uplink (site-input) receiver on a dedicated RTL-SDR instead of
     // sharing the Pluto with TX. A Pluto transmitting on the control channel
@@ -285,6 +292,9 @@ public:
     ~ControlChannel();
 
     void configure(const SiteConfig& cfg);
+    // Apply TX-side setup that must happen before the TX stream is activated
+    // (currently the RF bandwidth needed for the composite CC+voice carrier).
+    void prepareTx();
     bool start();
     void stop();
     bool isRunning() const;
@@ -316,6 +326,12 @@ public:
     bool unitRegistered(uint32_t unit) const;
     bool unitAffiliated(uint32_t unit, uint16_t tgid) const;
 
+    // Composite voice repeat. The repeater itself is owned by the RX pipeline;
+    // hand it over before start(). True while a voice transmission is present.
+    void setVoiceRepeater(p25rx::VoiceRepeater* v) { m_voice = v; }
+    bool voiceActive() const;
+    bool voiceRepeatEnabled() const;
+
 private:
     void producerThread();
     void addLog(const std::string& msg);
@@ -338,5 +354,10 @@ private:
 
     mutable std::mutex   m_activityMutex;
     std::unordered_map<uint32_t, RadioActivity> m_radios;
+
+    p25rx::VoiceRepeater* m_voice = nullptr;
+    double   m_voiceOffsetTx = 0.0;   // voice downlink relative to the CC carrier
+    uint32_t m_lastTalker    = 0;     // guarded by m_activityMutex
+    std::chrono::steady_clock::time_point m_callStarted{};  // guarded likewise
 };
 

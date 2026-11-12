@@ -52,6 +52,7 @@ void SitePanel::saveConfig() {
         j["plutoGainDb"]     = m_cfg.plutoGainDb;
         j["ampEnabled"]      = m_cfg.ampEnabled;
         j["minimalCc"]       = m_cfg.minimalCc;
+        j["voiceRepeat"]     = m_cfg.voiceRepeat;
         j["rxUseRtlsdr"]     = m_cfg.rxUseRtlsdr;
         j["chanId"]          = m_cfg.chanId;
         j["voiceChanId"]     = m_cfg.voiceChanId;
@@ -100,6 +101,7 @@ void SitePanel::loadConfig() {
         m_cfg.plutoGainDb     = j.value("plutoGainDb",     m_cfg.plutoGainDb);
         m_cfg.ampEnabled      = j.value("ampEnabled",      m_cfg.ampEnabled);
         m_cfg.minimalCc       = j.value("minimalCc",       m_cfg.minimalCc);
+        m_cfg.voiceRepeat     = j.value("voiceRepeat",     m_cfg.voiceRepeat);
         m_cfg.rxUseRtlsdr     = j.value("rxUseRtlsdr",     m_cfg.rxUseRtlsdr);
         m_cfg.chanId          = j.value("chanId",          m_cfg.chanId);
         m_cfg.voiceChanId     = j.value("voiceChanId",     m_cfg.voiceChanId);
@@ -368,8 +370,12 @@ void SitePanel::applyConfig() {
 
     const bool ccRunning = m_cc.isRunning();
     const bool rxRunning = m_rx.isRunning();
+    const bool txRunning = m_tx.isRunning();
     if (ccRunning) m_cc.stop();
     if (rxRunning) m_rx.stop();
+    // Stop the TX stream so frequency/bandwidth changes are applied while the
+    // AD9361 is idle, then bring it back after RX is configured.
+    if (txRunning) m_tx.stopTx();
 
     m_tx.setFrequencyTrimHz(m_cfg.txFreqTrimHz);
     m_tx.setFrequency(m_cfg.ccFreqHz);
@@ -377,6 +383,8 @@ void SitePanel::applyConfig() {
     m_tx.setAmpEnabled(m_cfg.ampEnabled);
     m_cc.configure(m_cfg);
     m_rx.configure(m_cfg);
+    m_cc.setVoiceRepeater(m_rx.voiceRepeater());
+    m_cc.prepareTx();
 
     if (m_tx.isOpen() && !m_tx.frequencyValid()) {
         m_statusMsg     = m_tx.lastError();
@@ -385,6 +393,7 @@ void SitePanel::applyConfig() {
     }
 
     if (rxRunning) m_rx.start();
+    if (txRunning) m_tx.startTx();
     if (ccRunning) m_cc.start();
 
     m_statusMsg     = "Applied.";
@@ -514,6 +523,12 @@ void SitePanel::render() {
     if (ImGui::Checkbox("Minimal CC (IDEN_UP/NET_STS/RFSS_STS/SYNC only)",
                         &m_cfg.minimalCc))
         applyConfig();
+
+    if (ImGui::Checkbox("Repeat voice (composite CC + VC TX/RX)", &m_cfg.voiceRepeat))
+        applyConfig();
+    if (m_cfg.voiceRepeat)
+        ImGui::TextDisabled("Needs CC/VC >=100 kHz apart; widens the TX/RX RF "
+                            "bandwidth. Use separate TX/RX ports/antennas on a Pluto+.");
 
     ImGui::Checkbox("Uplink RX on RTL-SDR (free it from SDRTrunk)", &m_cfg.rxUseRtlsdr);
     if (m_cfg.rxUseRtlsdr)

@@ -92,6 +92,9 @@ void P25Receiver::reset()
     m_decimN   = 0;
     m_decimI   = 0.0;
     m_decimQ   = 0.0;
+    m_firPos   = 0;
+    std::fill(m_firI.begin(), m_firI.end(), 0.0f);
+    std::fill(m_firQ.begin(), m_firQ.end(), 0.0f);
     m_spsEst   = m_sps;
     m_fswWin   = 0;
     m_state    = State::Hunt;
@@ -167,13 +170,33 @@ void P25Receiver::process(const float* iq, size_t n)
             m_mixPhase += mixInc;
             if (m_mixPhase > 2.0 * M_PI) m_mixPhase -= 2.0 * M_PI;
         }
-        m_decimI += I;
-        m_decimQ += Q;
+        // Anti-alias FIR at the input rate, then take every m_decim-th sample.
+        // A plain boxcar decimator (the previous behaviour) folds the voice
+        // uplink, which sits ~250 kHz away in the composite RX stream, onto a
+        // tone near the edge of the control-channel passband. The FIR rejects
+        // that adjacent channel so the CC can share the RX stream with voice.
+        m_firI[m_firPos] = I;
+        m_firQ[m_firPos] = Q;
         m_stats.samples++;
-        if (++m_decimN < m_decim) continue;
-        float dI = float(m_decimI / double(m_decim));
-        float dQ = float(m_decimQ / double(m_decim));
-        m_decimI = 0.0; m_decimQ = 0.0; m_decimN = 0;
+        const bool decimate = (++m_decimN >= m_decim);
+        if (decimate) {
+            m_decimN = 0;
+            const int L = m_firLen;
+            double sI = 0.0, sQ = 0.0;
+            int idx = m_firPos;
+            for (int t = 0; t < L; ++t) {
+                sI += double(m_firTaps[t]) * m_firI[idx];
+                sQ += double(m_firTaps[t]) * m_firQ[idx];
+                idx = (idx - 1 + L) % L;
+            }
+            m_decimI = sI;
+            m_decimQ = sQ;
+        }
+        m_firPos = (m_firPos + 1) % m_firLen;
+        if (!decimate) continue;
+        float dI = float(m_decimI);
+        float dQ = float(m_decimQ);
+        m_decimI = 0.0; m_decimQ = 0.0;
 
         float fm = 0.0f;
         if (m_havePrev) {
@@ -398,11 +421,15 @@ void P25Receiver::processFrame()
 
     m_stats.framesTried++;
     uint16_t nac = 0; uint8_t duid = 0;
-    if (decodeNid(nidBits, &nac, &duid) && duid == p25::DUID_TSBK &&
-        (m_nac == 0 || nac == m_nac)) {
+    if (decodeNid(nidBits, &nac, &duid) && (m_nac == 0 || nac == m_nac)) {
         m_stats.nidOk++;
-        for (int i = 0; i < 98; ++i) m_dataDibits[i] = m_frameBuf[32 + i];
-        decodeTsbkBlock();
+        if (m_onFrame) m_onFrame(nac, duid);
+        // Only TSBK frames carry the trellis-coded signalling block; voice
+        // frames (HDU/LDU/TDU) stop here and are reported via the frame hook.
+        if (duid == p25::DUID_TSBK) {
+            for (int i = 0; i < 98; ++i) m_dataDibits[i] = m_frameBuf[32 + i];
+            decodeTsbkBlock();
+        }
     }
     m_state  = State::Hunt;
     m_fswWin = 0;
@@ -410,11 +437,12 @@ void P25Receiver::processFrame()
 
 bool P25Receiver::decodeNid(uint64_t codeword, uint16_t* outNac, uint8_t* outDuid)
 {
-    // Brute force over 16-bit data with DUID = TSBK (only 4096 candidates).
+    // Brute force over the 16-bit NID data (NAC<<4 | DUID). This is only run
+    // once per detected frame sync, so the 65536-candidate search is cheap.
     int best = std::numeric_limits<int>::max();
     uint16_t bestData = 0;
     for (uint32_t data = 0; data < 0x10000u; ++data) {
-        if ((data & 0xF) != p25::DUID_TSBK) continue;
+        if (!(m_duidMask & (1u << (data & 0xF)))) continue;
         uint64_t cw = p25::encodeBCH(uint16_t(data));
         int dist = popcount64(cw ^ codeword);
         if (dist < best) { best = dist; bestData = uint16_t(data); if (dist == 0) break; }

@@ -1,5 +1,6 @@
 #include "rx/RxPipeline.hpp"
 #include "rx/P25Receiver.hpp"
+#include "rx/VoiceRepeater.hpp"
 #include "p25/C4FM.hpp"
 #include "p25/Frame.hpp"
 #include "p25/TSBK.hpp"
@@ -61,6 +62,8 @@ void printUsage(const char* argv0)
         << "                    (transmits RF on --rx-freq for --duration seconds)\n"
         << "  --tx-gain <dB>    TX gain for --key-tx (Pluto 0-89, default 60)\n"
         << "  --duration <sec>  Stop after N seconds (0 = until Ctrl-C)\n"
+        << "  --selftest        Modulate + decode known TSBKs (no RF)\n"
+        << "  --voicetest       Composite CC+voice repeat loopback (no RF)\n"
         << "  --help            Show this help\n\n"
         << "Example:\n"
         << "  " << argv0 << " --rx-freq 145.65 --nac 293 --sysid 123\n";
@@ -94,6 +97,7 @@ struct RxSource {
     std::string recordPath;      // write raw CF32 IQ instead of/while decoding
     bool        iqCf32   = false;  // offline reader: file is raw float32 I/Q
     bool        selftest = false;  // modulate known TSBKs -> decode (no RF)
+    bool        voicetest = false; // composite CC+voice repeat loopback (no RF)
     int         ssInterval = 35;   // OSP status symbol interval (frame dibits)
     int         mixHz = 0;         // baseband downconvert for off-centre IQ
     double      gardner = 0.00015; // Gardner timing loop gain
@@ -234,6 +238,10 @@ ParseResult parseArgs(int argc, char** argv, SiteConfig& cfg, RxSource& rx)
         }
         if (arg == "--selftest") {
             rx.selftest = true;
+            continue;
+        }
+        if (arg == "--voicetest") {
+            rx.voicetest = true;
             continue;
         }
         if (arg == "--ss") {
@@ -488,6 +496,119 @@ int runSelfTest()
     return ok ? 0 : 2;
 }
 
+int runVoiceTest()
+{
+    // Composite CC + voice loopback: generate independent CC and VC frames,
+    // mix them to opposite offsets around a shared centre, and prove that the
+    // voice repeater recovers and re-modulates the VC frame while the CC
+    // receiver still decodes the CC frame through the adjacent-channel
+    // interference. No SDR hardware is involved.
+    const double rate   = 1536000.0;
+    const double offset = 250e3;
+    const uint16_t nac  = 0x293;
+
+    const auto ccTsbk = p25::BuildURegRsp(true, 0x123, 0x111111, 0x111111);
+    const auto vcTsbk = p25::BuildURegRsp(true, 0x123, 0x222222, 0x222222);
+
+    p25::C4FM ccMod, vcMod;
+    if (!ccMod.configure(rate) || !vcMod.configure(rate)) {
+        std::cerr << "C4FM configure failed\n";
+        return 1;
+    }
+    ccMod.setDeviationPeakHz(1800.0);
+    vcMod.setDeviationPeakHz(1800.0);
+
+    auto ccIq = ccMod.modulate(p25::BuildFrame(nac, ccTsbk));
+    auto vcIq = vcMod.modulate(p25::BuildFrame(nac, vcTsbk));
+
+    const size_t n     = std::max(ccIq.size(), vcIq.size());
+    const size_t pad   = size_t(rate * 0.05);
+    const size_t total = n + pad;
+
+    std::vector<float> composite(total * 2, 0.0f);
+    const double inc = 2.0 * M_PI * offset / rate;
+    std::complex<double> ccRot(1.0, 0.0), ccStep(std::cos(inc), std::sin(inc));
+    std::complex<double> vcRot(1.0, 0.0), vcStep(std::cos(-inc), std::sin(-inc));
+    for (size_t i = 0; i < total; ++i) {
+        float ci = 0, cq = 0, vi = 0, vq = 0;
+        const size_t j = (i >= pad / 2) ? i - pad / 2 : SIZE_MAX;
+        if (j != SIZE_MAX && j < ccIq.size() / 2) {
+            ci = float(ccIq[2 * j]) / 127.0f;
+            cq = float(ccIq[2 * j + 1]) / 127.0f;
+        }
+        if (j != SIZE_MAX && j < vcIq.size() / 2) {
+            vi = float(vcIq[2 * j]) / 127.0f;
+            vq = float(vcIq[2 * j + 1]) / 127.0f;
+        }
+        composite[2 * i]     = float(ci * ccRot.real() - cq * ccRot.imag()) +
+                               float(vi * vcRot.real() - vq * vcRot.imag());
+        composite[2 * i + 1] = float(ci * ccRot.imag() + cq * ccRot.real()) +
+                               float(vi * vcRot.imag() + vq * vcRot.real());
+        ccRot *= ccStep;
+        vcRot *= vcStep;
+    }
+
+    p25rx::VoiceRepeater vr;
+    if (!vr.configure(rate, +offset)) { std::cerr << "voice configure failed\n"; return 2; }
+    for (size_t off = 0; off < total; off += 4096) {
+        size_t c = std::min<size_t>(4096, total - off);
+        vr.process(composite.data() + off * 2, c);
+    }
+
+    // Re-modulate the recovered discriminator exactly as ControlChannel does.
+    std::vector<float> vcOut(total * 2, 0.0f);
+    {
+        const double step         = vr.demodRate() / rate;
+        const double phasePerUnit = 2.0 * M_PI * 600.0 / rate;
+        const double offsetInc    = 2.0 * M_PI * (-offset) / rate;
+        double pos = 0.0, phase = 0.0;
+        float prev = 0.0f, next = 0.0f;
+        for (size_t i = 0; i < total; ++i) {
+            const float s = prev + (next - prev) * float(pos);
+            pos += step;
+            while (pos >= 1.0) {
+                pos -= 1.0;
+                prev = next;
+                float x = 0.0f;
+                next = vr.readFm(x) ? x : prev;
+            }
+            phase += s * phasePerUnit + offsetInc;
+            if (phase > 2.0 * M_PI) phase -= 2.0 * M_PI;
+            else if (phase < -2.0 * M_PI) phase += 2.0 * M_PI;
+            vcOut[2 * i]     = float(std::cos(phase)) * 0.5f;
+            vcOut[2 * i + 1] = float(std::sin(phase)) * 0.5f;
+        }
+    }
+
+    auto decode = [&](const float* iq, double mix, std::array<uint8_t, 12>& got) {
+        p25rx::P25Receiver rx;
+        rx.configure(rate, nac);
+        rx.setMixOffset(mix);
+        bool have = false;
+        rx.setTsbkCallback([&](const std::array<uint8_t, 12>& t) {
+            if (!have) { got = t; have = true; }
+        });
+        for (size_t off = 0; off < total; off += 2048) {
+            size_t k = std::min<size_t>(2048, total - off);
+            rx.process(iq + off * 2, k);
+        }
+        return have;
+    };
+
+    std::array<uint8_t, 12> vcGot{}, ccGot{};
+    const bool vcOk = decode(vcOut.data(), +offset, vcGot);
+    const bool ccOk = decode(composite.data(), -offset, ccGot);
+    const bool vcMatch = vcOk && std::memcmp(vcGot.data(), vcTsbk.data(), 12) == 0;
+    const bool ccMatch = ccOk && std::memcmp(ccGot.data(), ccTsbk.data(), 12) == 0;
+
+    std::cout << "voicetest: voice decode=" << vcOk << " match=" << vcMatch
+              << "  cc decode=" << ccOk << " match=" << ccMatch
+              << "  squelch=" << (vr.squelchOpen() ? 1 : 0) << "\n";
+    const bool pass = vcMatch && ccMatch;
+    std::cout << "voicetest: " << (pass ? "PASS" : "FAIL") << "\n";
+    return pass ? 0 : 2;
+}
+
 int runNativeRtl(const RxSource& rx, const SiteConfig& cfg)
 {
     rtlsdr_dev_t* dev = nullptr;
@@ -581,6 +702,9 @@ int main(int argc, char** argv)
 
     if (rxSource.selftest)
         return runSelfTest();
+
+    if (rxSource.voicetest)
+        return runVoiceTest();
 
     if (!rxSource.iqPath.empty())
         return runOfflineIq(rxSource);

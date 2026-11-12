@@ -50,6 +50,16 @@ void CCPanel::render(const SiteConfig& cfg) {
                 cfg.ccFreqHz / 1e6, unsigned(cfg.chanId), unsigned(cfg.ccChanNum));
     ImGui::Text("VC: %.5f MHz  (IDEN %u, ch %u)",
                 cfg.voiceFreqHz() / 1e6, unsigned(cfg.voiceChanId), unsigned(cfg.vChanNum));
+    if (m_cc.voiceRepeatEnabled()) {
+        if (m_cc.voiceActive())
+            ImGui::TextColored(ImVec4(0.25f, 1.0f, 0.4f, 1.0f), "Voice repeat: REPEATING");
+        else
+            ImGui::TextColored(ImVec4(0.55f, 0.80f, 1.0f, 1.0f), "Voice repeat: listening");
+    } else if (!cfg.voiceRepeat) {
+        ImGui::TextDisabled("Voice repeat: disabled (enable in Site Config)");
+    } else if (running) {
+        ImGui::TextDisabled("Voice repeat: off (CC and VC must be >=100 kHz apart)");
+    }
 
     if (!m_startError.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
@@ -112,15 +122,16 @@ void CCPanel::render(const SiteConfig& cfg) {
                         m_rx.useRtlsdrSource();
                     }
                     if (sharedPluto) {
-                        // Full duplex on one radio: bring RX up first so
-                        // dsd-neo can share the already-open device, then start
-                        // the TX stream.
                         m_rx.configure(plan);
+                        m_cc.setVoiceRepeater(m_rx.voiceRepeater());
+                        m_cc.prepareTx();
                         m_rx.start();
                         m_tx.startTx();
                     } else {
-                        m_tx.startTx();
                         m_rx.configure(plan);
+                        m_cc.setVoiceRepeater(m_rx.voiceRepeater());
+                        m_cc.prepareTx();
+                        m_tx.startTx();
                         m_rx.start();
                     }
                     m_cc.start();

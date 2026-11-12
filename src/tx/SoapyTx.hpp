@@ -27,6 +27,10 @@ void setFrequencyTrimHz(double hz) { m_freqTrimHz = hz; }
     void setGain(double db);
     void setAmpEnabled(bool en);
     void setSampleRate(double sps);
+    // TX RF bandwidth (Hz). A composite CC+voice stream needs a bandwidth that
+    // spans both carriers; ignored by radios that do not expose it.
+    void setTxBandwidth(double hz);
+    double txBandwidth() const { return m_txBandwidth; }
 
     // Write int8 IQ bytes into ring buffer
     void write(const int8_t* data, size_t n);
@@ -81,6 +85,8 @@ double m_freqTrimHz = 0.0;
     double m_gain       = 20.0;
     double m_sampleRate = 2.4e6;
     double m_actualSampleRate = 0.0;
+    double m_txBandwidth = 0.0;
+    bool   m_txBandwidthDirty = false;
     bool   m_ampEnabled = false;
 
     std::atomic<bool> m_running{false};

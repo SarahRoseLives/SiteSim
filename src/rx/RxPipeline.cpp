@@ -1,7 +1,9 @@
 #include "rx/RxPipeline.hpp"
 #include "rx/P25Receiver.hpp"
+#include "rx/VoiceRepeater.hpp"
 #include "p25/TSBK.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -34,6 +36,22 @@ constexpr uint8_t P25_ISP_GRP_AFF_Q_RSP = 0x29;
 // Unit De-Registration Request (ISP 0x2B): sent by a radio when it powers down
 // or leaves the system. (0x2F is the outbound acknowledge, not an inbound one.)
 constexpr uint8_t P25_ISP_U_DE_REG_REQ = 0x2B;
+
+// P25 Phase 1 DUIDs that carry voice. Everything else (notably TSBK 0x7) is
+// control/data and must not open the voice repeat gate.
+static bool isVoiceDuid(uint8_t duid)
+{
+    switch (duid) {
+    case 0x0:   // HDU
+    case 0x3:   // TDU
+    case 0x5:   // LDU1
+    case 0xA:   // LDU2
+    case 0xF:   // TDULC
+        return true;
+    default:
+        return false;
+    }
+}
 
 #if defined(_WIN32)
 #include <io.h>
@@ -115,6 +133,33 @@ void RxPipeline::configure(const SiteConfig& cfg)
 {
     m_cfg = cfg;
     m_cfg.normalizeChannelPlan();
+    updateCompositePlan();
+    if (!m_voice) m_voice = std::make_unique<p25rx::VoiceRepeater>();
+}
+
+// Centre the receiver between the control-channel and voice-channel uplinks so
+// one IQ stream carries both. When the two are too close to separate with a
+// single wideband front end, fall back to control-channel-only reception.
+void RxPipeline::updateCompositePlan()
+{
+    const double off  = m_cfg.txOffsetMHz * 1e6;
+    const double ccUp = m_cfg.ccFreqHz + off;
+    const double vcUp = m_cfg.voiceFreqHz() + off;
+    const double sep  = std::abs(ccUp - vcUp);
+
+    m_voiceEnabled = m_cfg.voiceRepeat && (sep >= 100e3);
+    if (m_voiceEnabled) {
+        m_rxCenterHz = 0.5 * (ccUp + vcUp);
+        // P25Receiver convention: mixOffset = centre - signal frequency.
+        m_ccMixHz = m_rxCenterHz - ccUp;
+        m_vcMixHz = m_rxCenterHz - vcUp;
+        m_rxBandwidthHz = std::max(1.0e6, sep + 300e3);
+    } else {
+        m_rxCenterHz = ccUp + 180e3;   // dodge the tuner DC spike
+        m_ccMixHz    = 180e3;
+        m_vcMixHz    = 0.0;
+        m_rxBandwidthHz = 600e3;
+    }
 }
 
 void RxPipeline::useRtlsdrSource()
@@ -521,9 +566,30 @@ void RxPipeline::startNative()
 
     m_rx = new p25rx::P25Receiver();
     m_rx->configure(double(m_nativeRate), m_cfg.nac);
-    m_rx->setMixOffset(double(m_nativeOffsetHz));
+    m_rx->setMixOffset(m_ccMixHz);
     m_rx->setSsInterval(35);
     m_rx->setTsbkCallback([this](const std::array<uint8_t, 12>& t) { onNativeTsbk(t.data()); });
+
+    if (m_voice) {
+        delete m_voiceRx;
+        m_voiceRx = nullptr;
+        if (!m_voiceEnabled || !m_voice->configure(double(m_nativeRate), m_vcMixHz)) {
+            m_voice->disable();
+        } else {
+            // Decode the voice channel's NID and gate the repeater on real
+            // voice frames. Energy alone cannot distinguish the talker from
+            // adjacent-channel interference or the site's own TX leakage.
+            m_voice->enableFrameGate();
+            m_voiceRx = new p25rx::P25Receiver();
+            m_voiceRx->configure(double(m_nativeRate), m_cfg.nac);
+            m_voiceRx->setMixOffset(m_vcMixHz);
+            m_voiceRx->setDuidMask((1u << 0x0) | (1u << 0x3) | (1u << 0x5) |
+                                   (1u << 0xA) | (1u << 0xF));
+            m_voiceRx->setFrameCallback([this](uint16_t, uint8_t duid) {
+                if (m_voice && isVoiceDuid(duid)) m_voice->noteVoiceFrame();
+            });
+        }
+    }
 
     if (!g_rx_logfile)
         g_rx_logfile = fopen(rx_logfile_path(), "w");
@@ -531,9 +597,16 @@ void RxPipeline::startNative()
     m_nativeStop.store(false);
     m_running.store(true);
     if (m_log) {
-        char m[192];
-        snprintf(m, sizeof(m), "RX started (native P25 receiver) %s @ %.4f MHz",
-                 sourceName().c_str(), m_cfg.rxFreqHz() / 1e6);
+        char m[256];
+        if (m_voice && m_voice->enabled()) {
+            snprintf(m, sizeof(m), "RX started (native P25 receiver) %s @ %.4f MHz "
+                     "(composite CC+VC, centre %.4f MHz, CC mix %+.0f kHz, VC mix %+.0f kHz)",
+                     sourceName().c_str(), m_cfg.rxFreqHz() / 1e6,
+                     m_rxCenterHz / 1e6, m_ccMixHz / 1e3, m_vcMixHz / 1e3);
+        } else {
+            snprintf(m, sizeof(m), "RX started (native P25 receiver) %s @ %.4f MHz",
+                     sourceName().c_str(), m_cfg.rxFreqHz() / 1e6);
+        }
         m_log(m);
     }
     m_nativeThread = std::thread(m_soapy ? &RxPipeline::nativeSoapyThread
@@ -544,8 +617,12 @@ void RxPipeline::stopNative()
 {
     m_nativeStop.store(true);
     if (m_nativeThread.joinable()) m_nativeThread.join();
+    if (m_voice) m_voice->disable();
+
     delete m_rx;
     m_rx = nullptr;
+    delete m_voiceRx;
+    m_voiceRx = nullptr;
     if (g_rx_logfile) { fflush(g_rx_logfile); fclose(g_rx_logfile); g_rx_logfile = nullptr; }
     m_running.store(false);
 }
@@ -559,7 +636,7 @@ void RxPipeline::nativeRtlThread(RxPipeline* self)
         return;
     }
     rtlsdr_set_sample_rate(dev, uint32_t(self->m_nativeRate));
-    long center = long(self->m_cfg.rxFreqHz()) + self->m_nativeOffsetHz;
+    long center = long(self->m_rxCenterHz);
     if (center < 0) center = 0;
     rtlsdr_set_center_freq(dev, uint32_t(center));
     rtlsdr_set_tuner_gain_mode(dev, 1);   // AGC
@@ -577,6 +654,9 @@ void RxPipeline::nativeRtlThread(RxPipeline* self)
             f[2 * i + 1] = (float(buf[2 * i + 1]) - 127.5f) / 127.5f;
         }
         self->m_rx->process(f.data(), size_t(ns));
+        if (self->m_voiceRx) self->m_voiceRx->process(f.data(), size_t(ns));
+        if (self->m_voice && self->m_voice->enabled())
+            self->m_voice->process(f.data(), size_t(ns));
     }
     rtlsdr_close(dev);
 }
@@ -601,37 +681,30 @@ void RxPipeline::nativeSoapyThread(RxPipeline* self)
     SoapySDR::Stream* stream = nullptr;
     try {
         dev->setSampleRate(SOAPY_SDR_RX, 0, double(self->m_nativeRate));
-        long center = long(self->m_cfg.rxFreqHz()) + self->m_nativeOffsetHz;
+        long center = long(self->m_rxCenterHz);
         dev->setFrequency(SOAPY_SDR_RX, 0, double(center));
         try { dev->setGainMode(SOAPY_SDR_RX, 0, true); } catch (...) {}
-        // On a shared Pluto the site's own TX is only a few MHz away, and the
-        // AD9361's RX RF bandwidth is left at the firmware default by the
-        // SoapyPlutoSDR module. That wide front-end passes the TX leak and its
-        // AGC desenses the uplink. Request a narrow bandwidth that still covers
-        // the deliberate RX offset (180 kHz) but rejects the TX carrier.
-        const bool sharedPluto = self->m_shareDevice &&
-            (self->m_soapyProfile.find("pluto") != std::string::npos ||
-             self->m_soapyArgs.find("pluto") != std::string::npos);
-        if (sharedPluto) {
-            const double bw = 600e3;
-            try { dev->setBandwidth(SOAPY_SDR_RX, 0, bw); } catch (...) {}
-        }
+        // The composite stream carries the CC and voice uplinks at the same
+        // time, so the RX bandwidth must span both. On a shared Pluto the TX is
+        // still >5 MHz away, well outside this filter, so the TX leak is
+        // rejected while both uplinks pass.
+        try { dev->setBandwidth(SOAPY_SDR_RX, 0, self->m_rxBandwidthHz); } catch (...) {}
         stream = dev->setupStream(SOAPY_SDR_RX, "CF32");
         if (!stream) throw std::runtime_error("setupStream failed");
         dev->activateStream(stream);
-        char rb[192];
+        char rb[224];
         double actRate = double(self->m_nativeRate);
         try { actRate = dev->getSampleRate(SOAPY_SDR_RX, 0); } catch (...) {}
         double actBw = 0.0;
         try { actBw = dev->getBandwidth(SOAPY_SDR_RX, 0); } catch (...) {}
         snprintf(rb, sizeof(rb),
-                 "Soapy RX active req=%.0f actual=%.0f center=%.4f MHz off=%d bw=%.0f",
+                 "Soapy RX active req=%.0f actual=%.0f center=%.4f MHz ccMix=%+.0f vcMix=%+.0f bw=%.0f",
                  double(self->m_nativeRate), actRate, double(center) / 1e6,
-                 self->m_nativeOffsetHz, actBw);
+                 self->m_ccMixHz / 1e3, self->m_vcMixHz / 1e3, actBw);
         diag(rb);
     } catch (const std::exception& e) {
         diag(std::string("Soapy RX setup failed: ") + e.what());
-        if (stream) dev->closeStream(stream);
+        if (stream) { try { dev->closeStream(stream); } catch (...) {} }
         if (own) SoapySDR::Device::unmake(dev);
         self->m_running.store(false);
         return;
@@ -660,27 +733,36 @@ void RxPipeline::nativeSoapyThread(RxPipeline* self)
                 ++rmsN;
             }
             self->m_rx->process(f.data(), size_t(n));
+            if (self->m_voiceRx) self->m_voiceRx->process(f.data(), size_t(n));
+            if (self->m_voice && self->m_voice->enabled())
+                self->m_voice->process(f.data(), size_t(n));
             if (rec) { fwrite(f.data(), sizeof(float), f.size(), rec); fflush(rec); }
             if (++chunks >= 200 && rmsN) {
-                char b[160];
+                char b[192];
                 const auto& st = self->m_rx->stats();
+                float vp = 0.0f, vn = 0.0f;
+                if (self->m_voice && self->m_voice->enabled()) {
+                    vp = self->m_voice->stats().power;
+                    vn = self->m_voice->stats().noiseFloor;
+                }
                 snprintf(b, sizeof(b),
-                         "rx rms=%.4f syms=%llu fsw=%llu nid=%llu tsbk=%llu fswD=%d invD=%d smin=%.1f smax=%.1f amp=%.2f dc=%.2f",
+                         "rx rms=%.4f syms=%llu fsw=%llu nid=%llu tsbk=%llu fswD=%d invD=%d smin=%.1f smax=%.1f amp=%.2f dc=%.2f vp=%.4f vnf=%.4f vsq=%d",
                          std::sqrt(rmsAcc / double(rmsN)),
                          (unsigned long long)st.symbols,
                          (unsigned long long)st.fswHits,
                          (unsigned long long)st.nidOk,
                          (unsigned long long)st.tsbks,
                          st.minFswDist, st.minFswDistInv, st.symMin, st.symMax,
-                         st.lastAmp, st.lastDc);
+                         st.lastAmp, st.lastDc, vp, vn,
+                         (self->m_voice && self->m_voice->squelchOpen()) ? 1 : 0);
                 diag(b);
                 chunks = 0; rmsAcc = 0; rmsN = 0;
             }
         }
     }
     if (rec) fclose(rec);
-    dev->deactivateStream(stream);
-    dev->closeStream(stream);
+    try { dev->deactivateStream(stream); } catch (...) {}
+    try { dev->closeStream(stream); } catch (...) {}
     if (own) SoapySDR::Device::unmake(dev);
 }
 
